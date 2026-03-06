@@ -1,0 +1,10 @@
+[package]
+name = "engine_api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = {version = "0.38.0", features = ["bundled"]}
+core_types = { path = "../core_types" }
+chrono = "0.4.44"
+clap = { version = "4.5.60", features = ["derive"] }
