@@ -53,8 +53,9 @@ cargo build -p memd-mcp
 
 ### Connect to Claude Desktop
 
-Add to `%APPDATA%\Claude\claude_desktop_config.json`:
+Create or edit the Claude Desktop config file for your platform:
 
+**Windows** — `%APPDATA%\Claude\claude_desktop_config.json`
 ```json
 {
   "mcpServers": {
@@ -65,7 +66,46 @@ Add to `%APPDATA%\Claude\claude_desktop_config.json`:
 }
 ```
 
+**macOS** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+```json
+{
+  "mcpServers": {
+    "memd": {
+      "command": "/path/to/memd/target/debug/memd-mcp"
+    }
+  }
+}
+```
+
 Restart Claude Desktop. The tools will be available in every conversation.
+
+### Connect to Cursor
+
+Create or edit the Cursor MCP config file for your platform:
+
+**Windows** — `%APPDATA%\Cursor\User\globalStorage\cursor.mcp\mcp.json`
+```json
+{
+  "mcpServers": {
+    "memd": {
+      "command": "C:\\path\\to\\memd\\target\\debug\\memd-mcp.exe"
+    }
+  }
+}
+```
+
+**macOS** — `~/.cursor/mcp.json`
+```json
+{
+  "mcpServers": {
+    "memd": {
+      "command": "/path/to/memd/target/debug/memd-mcp"
+    }
+  }
+}
+```
+
+Restart Cursor. The tools will be available to the AI in every conversation.
 
 ## Data
 
