@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::fmt;
-
 /// Domain-level errors: only things we can validate locally (no DB lookups).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -29,7 +30,7 @@ pub type EntryId = i64;
 pub type SnapshotId = i64;
 pub type SeqNumber = i64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum EntrySource {
     User,
     Agent,

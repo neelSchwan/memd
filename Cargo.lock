@@ -195,6 +195,8 @@ name = "core_types"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -492,6 +494,8 @@ dependencies = [
  "engine_api",
  "rmcp",
  "rusqlite",
+ "schemars",
+ "serde",
  "serde_json",
  "tokio",
 ]
