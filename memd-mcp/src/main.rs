@@ -33,7 +33,10 @@ impl MemdServer {
     }
 
     /// Create a new memory volume with the given name
-    #[tool(name = "create_volume", description = "Create a new memory volume")]
+    #[tool(
+        name = "create_volume",
+        description = "Create a persistent memory namespace for a user, project, or long-running task. Use this before storing memory when you need separation between contexts. Do not use this for one-off chat turns; prefer reusing an existing volume when the context is the same."
+    )]
     pub async fn create_volume(
         &self,
         params: Parameters<CreateVolumeRequest>,
@@ -46,7 +49,10 @@ impl MemdServer {
     }
 
     /// List all memory volumes
-    #[tool(name = "list_volumes", description = "List all memory volumes")]
+    #[tool(
+        name = "list_volumes",
+        description = "List available memory namespaces. Use this when you do not yet know which volume to read from or write to. Do not use this as memory retrieval; use search_memory or list_memory for stored facts."
+    )]
     pub async fn list_volumes(&self) -> Result<Json<VolumeListResponse>, String> {
         let conn = self.conn.lock().unwrap();
 
@@ -57,11 +63,14 @@ impl MemdServer {
         }))
     }
 
-    /// Add a new memory entry to a volume
-    #[tool(name = "add_entry", description = "Add a new memory entry to a volume")]
-    pub async fn add_entry(
+    /// Store a durable memory entry in a volume
+    #[tool(
+        name = "remember",
+        description = "Store a durable fact in a memory volume. Use for user preferences, project decisions, constraints, and context likely to matter in future turns. Do not use for temporary reasoning, trivial back-and-forth chat, or information that does not need long-term persistence."
+    )]
+    pub async fn remember(
         &self,
-        params: Parameters<AddEntryRequest>,
+        params: Parameters<RememberRequest>,
     ) -> Result<Json<EntryResponse>, String> {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
@@ -73,11 +82,14 @@ impl MemdServer {
         Ok(Json(EntryResponse::from(&entry)))
     }
 
-    /// List all entries in a volume
-    #[tool(name = "list_entries", description = "List all entries in a volume")]
-    pub async fn list_entries(
+    /// List all memory entries in a volume
+    #[tool(
+        name = "list_memory",
+        description = "Return all stored memory entries in a volume in insertion order. Use this when you need full inspection or auditing of the memory state. Do not use this when you only need relevant entries; use search_memory for targeted retrieval."
+    )]
+    pub async fn list_memory(
         &self,
-        params: Parameters<VolumeIdRequest>,
+        params: Parameters<ListMemoryRequest>,
     ) -> Result<Json<EntryListResponse>, String> {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
@@ -90,14 +102,14 @@ impl MemdServer {
         }))
     }
 
-    /// Search entries in a volume by content substring
+    /// Search memory entries in a volume by content substring
     #[tool(
-        name = "search_entries",
-        description = "Search entries in a volume by content substring"
+        name = "search_memory",
+        description = "Retrieve memory entries relevant to a search phrase within one volume. Use this before answering when prior stored context may affect the response. Do not use this for web search, current events, or facts never written to this memory system."
     )]
-    pub async fn search_entries(
+    pub async fn search_memory(
         &self,
-        params: Parameters<SearchRequest>,
+        params: Parameters<SearchMemoryRequest>,
     ) -> Result<Json<EntryListResponse>, String> {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
@@ -113,7 +125,7 @@ impl MemdServer {
     /// Snapshot the current state of a volume
     #[tool(
         name = "create_snapshot",
-        description = "Snapshot the current state of a volume"
+        description = "Create a point-in-time checkpoint for a memory volume. Use this after important milestones so you can revisit or branch later. Do not use this as a substitute for adding memory entries; snapshots preserve state but do not add new facts."
     )]
     pub async fn create_snapshot(
         &self,
@@ -131,11 +143,11 @@ impl MemdServer {
     /// List all snapshots for a volume
     #[tool(
         name = "list_snapshots",
-        description = "List all snapshots for a volume"
+        description = "List checkpoints for a memory volume. Use this to review memory history or pick a snapshot to branch from. Do not use this to retrieve memory facts directly; use list_memory or search_memory for content."
     )]
     pub async fn list_snapshots(
         &self,
-        params: Parameters<VolumeIdRequest>,
+        params: Parameters<ListSnapshotsRequest>,
     ) -> Result<Json<SnapshotListResponse>, String> {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
@@ -148,11 +160,14 @@ impl MemdServer {
         }))
     }
 
-    /// Clone a volume from a snapshot
-    #[tool(name = "clone_volume", description = "Clone a volume from a snapshot")]
-    pub async fn clone_volume(
+    /// Branch a new volume from a snapshot
+    #[tool(
+        name = "branch_from_snapshot",
+        description = "Create a new volume branched from a snapshot so you can continue from an earlier memory state without mutating the original timeline. Use this for alternative plans or what-if paths. Do not use this for normal ongoing updates to the same memory context."
+    )]
+    pub async fn branch_from_snapshot(
         &self,
-        params: Parameters<CloneVolumeRequest>,
+        params: Parameters<BranchFromSnapshotRequest>,
     ) -> Result<Json<VolumeResponse>, String> {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
@@ -200,6 +215,9 @@ impl From<&Entry> for EntryResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct CreateVolumeRequest {
+    #[schemars(
+        description = "Human-readable volume name for the memory namespace, such as a user, project, or task identifier."
+    )]
     pub name: String,
 }
 
@@ -211,14 +229,26 @@ pub struct VolumeResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct VolumeIdRequest {
+pub struct ListMemoryRequest {
+    #[schemars(
+        description = "Numeric ID of the memory volume to inspect. Use list_volumes first if the ID is unknown."
+    )]
     pub volume_id: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct AddEntryRequest {
+pub struct RememberRequest {
+    #[schemars(
+        description = "Numeric ID of the memory volume where this durable memory should be stored."
+    )]
     pub volume_id: i64,
+    #[schemars(
+        description = "Durable memory content to store, such as a user preference, project decision, constraint, or long-running context."
+    )]
     pub content: String,
+    #[schemars(
+        description = "Who produced the memory: user, agent, or tool. Use the source that best reflects origin."
+    )]
     pub source: EntrySource,
 }
 
@@ -232,20 +262,43 @@ pub struct EntryResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct SearchRequest {
+pub struct SearchMemoryRequest {
+    #[schemars(
+        description = "Numeric ID of the memory volume to search. Use list_volumes first if the ID is unknown."
+    )]
     pub volume_id: i64,
+    #[schemars(
+        description = "Search phrase for relevant stored memory. Prefer specific keywords, names, decisions, or constraints."
+    )]
     pub query: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct CreateSnapshotRequest {
+    #[schemars(
+        description = "Numeric ID of the memory volume to checkpoint."
+    )]
     pub volume_id: i64,
+    #[schemars(
+        description = "Human-readable checkpoint label describing the milestone or state being captured."
+    )]
     pub label: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct CloneVolumeRequest {
+pub struct BranchFromSnapshotRequest {
+    #[schemars(
+        description = "Numeric ID of the snapshot to branch from. Use list_snapshots to discover valid snapshot IDs."
+    )]
     pub snapshot_id: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ListSnapshotsRequest {
+    #[schemars(
+        description = "Numeric ID of the memory volume whose checkpoints you want to review."
+    )]
+    pub volume_id: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
