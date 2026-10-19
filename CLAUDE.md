@@ -27,7 +27,8 @@ Don't add a crate unless it is clearly necessary.
 - Remove dependencies that are no longer used. CI runs clippy, but it does not catch unused crates,
   so check `Cargo.toml` when you remove code.
 - Current dependencies, for reference: `rusqlite`, `chrono`, `serde`, `schemars` (domain and
-  storage); `clap` (CLI); `rmcp`, `tokio`, `anyhow` (MCP server).
+  storage); `clap` (CLI); `rmcp`, `tokio`, `anyhow` (MCP server); `tiny_http`, `serde_json`
+  (HTTP server).
 
 ## 3. Comments
 
@@ -67,6 +68,7 @@ Follow standard Rust naming (`snake_case` functions and variables, `CamelCase` t
 core_types/   Domain types and validation. No I/O, no database.
 engine_api/   SQLite storage. All logic lives here. Also the `memd` CLI binary.
 memd-mcp/     MCP server. A thin layer that maps tools to engine_api calls.
+memd-server/  HTTP API. A thin layer that maps JSON routes to engine_api calls.
 ```
 
 - **The event log is the source of truth.** The `entries` table is a projection of the log. Every

@@ -94,7 +94,7 @@ pub fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, DomainError> {
 
 /// A Volume is an isolated memory namespace.
 /// Volumes created by branching remember the snapshot they were branched from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Volume {
     id: VolumeId,
     name: String,
@@ -138,7 +138,7 @@ impl Volume {
 }
 
 /// An Entry is a single memory item stored in a Volume.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Entry {
     id: EntryId,
     volume_id: VolumeId,
@@ -253,7 +253,7 @@ impl std::str::FromStr for EventType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Event {
     seq: SeqNumber,
     volume_id: VolumeId,
@@ -338,7 +338,7 @@ impl Event {
 
 /// A Snapshot is a bookmark: it points to an event sequence number.
 /// A pointer of 0 marks the empty state before any event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     id: SnapshotId,
     volume_id: VolumeId,
@@ -394,14 +394,14 @@ impl Snapshot {
 }
 
 /// An entry whose content or tags differ between two points in a volume's history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EntryModification {
     pub before: Entry,
     pub after: Entry,
 }
 
 /// The difference between two points in a single volume's history.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MemoryDiff {
     pub from_seq: SeqNumber,
     pub to_seq: SeqNumber,
@@ -419,7 +419,7 @@ impl MemoryDiff {
 
 /// Outcome of rolling a volume back to a snapshot.
 /// Rollback never rewrites history: it appends compensating events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RollbackReport {
     pub volume_id: VolumeId,
     pub snapshot_id: SnapshotId,
@@ -432,7 +432,7 @@ pub struct RollbackReport {
 
 /// The difference between the live entries of two volumes. Entries are matched across volumes
 /// by origin, so an entry and its copy in a branch count as the same entry.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct VolumeDiff {
     pub from_volume_id: VolumeId,
     pub to_volume_id: VolumeId,
@@ -453,7 +453,7 @@ impl VolumeDiff {
 
 /// An entry that both sides of a merge changed differently since their common base.
 /// Merge leaves it untouched in the target. None means absent or deleted on that side.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeConflict {
     pub base: Option<Entry>,
     pub source: Option<Entry>,
@@ -463,7 +463,7 @@ pub struct MergeConflict {
 /// Outcome of merging one volume into another.
 /// Merge never rewrites history: it appends events to the target, and a real merge that changed
 /// anything or found conflicts records a "merged into <target>" snapshot on the source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeReport {
     pub source_volume_id: VolumeId,
     pub target_volume_id: VolumeId,

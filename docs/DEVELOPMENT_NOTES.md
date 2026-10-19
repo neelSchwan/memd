@@ -96,6 +96,21 @@ already-set origins. Each clone's copied puts are paired with their source puts 
 clone chain, and a correlated `UPDATE` was still quadratic per volume.
 `migration_links_long_clone_chains_quickly` (5,000 entries, two clone levels) fails on both.
 
+**The HTTP server is synchronous and dependency-light.** `memd-server` uses `tiny_http` (a small
+blocking server) rather than axum/hyper: the engine is synchronous SQLite, requests are handled
+one at a time on one connection, and that is plenty for a local tool. Routing is a single `match`
+on (method, path segments), so there is no router crate. `handle` is a plain function from request
+to response, so `memd-server/tests/api.rs` tests the API without opening a socket. Domain types
+derive `Serialize` (with chrono's `serde` feature), so the server needs no response structs of
+its own. The MCP server still has its own, because it also needs JSON schemas.
+
+**`memd-server` defends against web pages, not local processes.** A review showed that any web
+page could write to it (a cross-site form post or `no-cors` fetch) and read from it via DNS
+rebinding. `handle` therefore requires a local `Host` header, and requires `application/json` on
+every request except GET; browsers can't send that cross-site without a preflight, and the server
+never answers preflights. Bodies are capped at 1 MiB. One local process that sends a body slowly
+can still hold up the single request loop; that is accepted for a local tool.
+
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.
 
@@ -159,3 +174,10 @@ printf '%s\n' \
   origins for existing clones. New `diff_volumes` and `merge_volumes`, MCP tools of the same name,
   and `memd volume diff/merge`. Designed by a planning agent, then implemented and reviewed.
 - MCP diff responses now return full entries (with tags) for `before`/`after`, not just content.
+
+### 2026-10-19: HTTP API
+
+- New `memd-server` crate: JSON routes for everything the engine does, with errors mapped to
+  404/409/400/500, plus the local-only `Host` and JSON content-type checks. Configured with
+  `MEMD_DB` and `MEMD_ADDR`. `edit_entry` changes content and tags in one event, for PATCH. New dependencies: `tiny_http`, and
+  `serde_json` (already in the tree through `rmcp`).

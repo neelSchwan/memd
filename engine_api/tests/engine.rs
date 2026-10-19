@@ -383,6 +383,29 @@ fn restoring_a_deleted_entry_brings_back_its_tags() {
 }
 
 #[test]
+fn edit_entry_changes_content_and_tags_together_or_not_at_all() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "old".into(), EntrySource::User, vec![]).unwrap();
+
+    let bad_tag = edit_entry(
+        &conn,
+        entry.id(),
+        Some("new".into()),
+        Some(tags(&["bad tag"])),
+    );
+    assert!(bad_tag.is_err());
+    assert_eq!(get_entry(&conn, entry.id()).unwrap().content(), "old");
+
+    let edited = edit_entry(&conn, entry.id(), Some("new".into()), Some(tags(&["db"]))).unwrap();
+    assert_eq!(
+        (edited.content(), edited.tags()),
+        ("new", &tags(&["db"])[..])
+    );
+    assert_eq!(entry_history(&conn, vol.id(), entry.id()).unwrap().len(), 2);
+}
+
+#[test]
 fn rebuild_projection_repairs_tags() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
