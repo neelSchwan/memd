@@ -1,6 +1,6 @@
 use core_types::{EntrySource, EventType};
+use engine_api::Connection;
 use engine_api::*;
-use rusqlite::Connection;
 
 fn db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

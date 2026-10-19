@@ -13,11 +13,13 @@ use core_types::{
     DomainError, Entry, EntryId, EntryModification, EntrySource, Event, EventType, MemoryDiff,
     RollbackReport, SeqNumber, Snapshot, SnapshotId, Volume, VolumeId,
 };
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub use error::{EngineError, Result};
+// Re-exported so frontends can hold a connection without depending on rusqlite directly.
+pub use rusqlite::Connection;
 pub use schema::SCHEMA_VERSION;
 
 // ---------------------------------------------------------------------------
@@ -138,31 +140,63 @@ impl EventRow {
 
 const VOLUME_COLS: &str = "id, name, created_at, parent_snapshot_id";
 
-fn volume_from_parts(
+struct VolumeRow {
     id: VolumeId,
     name: String,
     created_at: String,
-    parent: Option<SnapshotId>,
-) -> Result<Volume> {
-    Ok(Volume::new(id, name, parse_datetime(&created_at)?, parent)?)
+    parent_snapshot_id: Option<SnapshotId>,
+}
+
+impl VolumeRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            created_at: row.get(2)?,
+            parent_snapshot_id: row.get(3)?,
+        })
+    }
+
+    fn into_volume(self) -> Result<Volume> {
+        Ok(Volume::new(
+            self.id,
+            self.name,
+            parse_datetime(&self.created_at)?,
+            self.parent_snapshot_id,
+        )?)
+    }
 }
 
 const SNAPSHOT_COLS: &str = "id, volume_id, event_seq_pointer, created_at, label";
 
-fn snapshot_from_parts(
+struct SnapshotRow {
     id: SnapshotId,
     volume_id: VolumeId,
-    pointer: SeqNumber,
+    event_seq_pointer: SeqNumber,
     created_at: String,
     label: String,
-) -> Result<Snapshot> {
-    Ok(Snapshot::new(
-        id,
-        volume_id,
-        pointer,
-        parse_datetime(&created_at)?,
-        label,
-    )?)
+}
+
+impl SnapshotRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            volume_id: row.get(1)?,
+            event_seq_pointer: row.get(2)?,
+            created_at: row.get(3)?,
+            label: row.get(4)?,
+        })
+    }
+
+    fn into_snapshot(self) -> Result<Snapshot> {
+        Ok(Snapshot::new(
+            self.id,
+            self.volume_id,
+            self.event_seq_pointer,
+            parse_datetime(&self.created_at)?,
+            self.label,
+        )?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,15 +496,14 @@ pub fn create_volume(conn: &Connection, name: String) -> Result<Volume> {
 
 /// Returns a single volume by id
 pub fn get_volume(conn: &Connection, volume_id: VolumeId) -> Result<Volume> {
-    let (id, name, created_at, parent) = conn
-        .query_row(
-            &format!("SELECT {VOLUME_COLS} FROM volumes WHERE id = ?1"),
-            [volume_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?
-        .ok_or(EngineError::VolumeNotFound(volume_id))?;
-    volume_from_parts(id, name, created_at, parent)
+    conn.query_row(
+        &format!("SELECT {VOLUME_COLS} FROM volumes WHERE id = ?1"),
+        [volume_id],
+        VolumeRow::from_row,
+    )
+    .optional()?
+    .ok_or(EngineError::VolumeNotFound(volume_id))?
+    .into_volume()
 }
 
 /// Returns all volumes in the database
@@ -479,13 +512,9 @@ pub fn list_volumes(conn: &Connection) -> Result<Vec<Volume>> {
         "SELECT {VOLUME_COLS} FROM volumes ORDER BY id ASC"
     ))?;
     let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+        .query_map([], VolumeRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter()
-        .map(|(id, name, created_at, parent)| volume_from_parts(id, name, created_at, parent))
-        .collect()
+    rows.into_iter().map(VolumeRow::into_volume).collect()
 }
 
 /// Creates a new volume branched from a snapshot.
@@ -764,23 +793,14 @@ pub fn snapshot(conn: &Connection, volume_id: VolumeId, label: String) -> Result
 
 /// Returns a single snapshot by id
 pub fn get_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Result<Snapshot> {
-    let (id, volume_id, pointer, created_at, label) = conn
-        .query_row(
-            &format!("SELECT {SNAPSHOT_COLS} FROM snapshots WHERE id = ?1"),
-            [snapshot_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or(EngineError::SnapshotNotFound(snapshot_id))?;
-    snapshot_from_parts(id, volume_id, pointer, created_at, label)
+    conn.query_row(
+        &format!("SELECT {SNAPSHOT_COLS} FROM snapshots WHERE id = ?1"),
+        [snapshot_id],
+        SnapshotRow::from_row,
+    )
+    .optional()?
+    .ok_or(EngineError::SnapshotNotFound(snapshot_id))?
+    .into_snapshot()
 }
 
 /// Returns all snapshots for a given volume
@@ -790,21 +810,9 @@ pub fn list_snapshots(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Snap
         "SELECT {SNAPSHOT_COLS} FROM snapshots WHERE volume_id = ?1 ORDER BY id ASC"
     ))?;
     let rows = stmt
-        .query_map([volume_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
+        .query_map([volume_id], SnapshotRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter()
-        .map(|(id, volume_id, pointer, created_at, label)| {
-            snapshot_from_parts(id, volume_id, pointer, created_at, label)
-        })
-        .collect()
+    rows.into_iter().map(SnapshotRow::into_snapshot).collect()
 }
 
 /// Reconstructs the live entries of a volume as they were when the snapshot was taken

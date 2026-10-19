@@ -1,11 +1,11 @@
 use core_types::{Entry, EntrySource, Event, EventType, MemoryDiff, Snapshot, Volume};
+use engine_api::Connection;
 use rmcp::{
     Json, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use rusqlite::Connection;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};

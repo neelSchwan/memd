@@ -493,10 +493,8 @@ dependencies = [
  "core_types",
  "engine_api",
  "rmcp",
- "rusqlite",
  "schemars",
  "serde",
- "serde_json",
  "tokio",
 ]
 
