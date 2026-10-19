@@ -164,6 +164,13 @@ The server has no authentication and only serves local use:
 `MEMD_ADDR` changes the listen port. All routes are listed at the top of
 [`memd-server/src/lib.rs`](memd-server/src/lib.rs).
 
+## Web UI
+
+`memd-server` also serves a small web UI at <http://localhost:7878/>. You can browse volumes,
+search and edit entries and tags, read the event history, take snapshots, view, diff and roll back
+to them, branch, and compare and merge volumes. It is a single static page with no build step,
+compiled into the server binary.
+
 ## CLI
 
 The `memd` binary exposes the same engine for scripting and inspection:
@@ -215,7 +222,7 @@ cargo clippy --all-targets
 
 - [x] HTTP API (`memd-server`) — so any service can call memd, not just MCP clients
 - [x] CLI (`memd`) — for scripting and git hooks
-- [ ] Web UI (`memd-ui`) — dashboard for browsing volumes, entries, and snapshot history
+- [x] Web UI — dashboard for browsing volumes, entries, and snapshot history (served by `memd-server`)
 - [x] Full-text search via SQLite FTS5
 - [x] Entry tagging and filtering
 - [x] `diff_snapshots`, `delete_entry`, `update_entry`, rollback
