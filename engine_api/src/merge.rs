@@ -165,10 +165,10 @@ fn write_change(conn: &Connection, target: VolumeId, write: &Write, at: &str) ->
     Ok(())
 }
 
-/// The versions (content and tags) entries have had, keyed by entry id.
-type Versions = HashMap<EntryId, Vec<(String, Vec<String>)>>;
+/// The versions (content and tags) entries have had, keyed by entry id. None stands for a delete.
+type Versions = HashMap<EntryId, Vec<Option<(String, Vec<String>)>>>;
 
-/// Every version each entry of a volume has had after `since`.
+/// Every version each entry of a volume has had after `since`, deletions included.
 fn versions_since(
     conn: &Connection,
     volume_id: VolumeId,
@@ -177,12 +177,10 @@ fn versions_since(
     let mut versions = Versions::new();
     let events = load_events(conn, volume_id, None)?;
     for event in events.iter().filter(|event| event.created_at() > since) {
-        if let Some(content) = event.content() {
-            versions
-                .entry(event.entry_id())
-                .or_default()
-                .push((content.to_string(), event.tags().to_vec()));
-        }
+        let version = event
+            .content()
+            .map(|content| (content.to_string(), event.tags().to_vec()));
+        versions.entry(event.entry_id()).or_default().push(version);
     }
     Ok(versions)
 }
@@ -228,15 +226,17 @@ fn plan_merge<'a>(
         if source_data == entry_data(target_entry) || source_data == entry_data(base_entry) {
             continue;
         }
-        // Since the base, the target already held this exact version, for example through a merge
-        // via another volume, and has moved on. Its later choice wins.
+        // Since the base, the target already held this exact version (or deletion), for example
+        // through a merge via another volume, and has moved on. Its later choice wins.
         let target_had_it = target_ids
             .get(&origin)
             .and_then(|entry_id| target_versions.get(entry_id))
             .is_some_and(|versions| {
-                versions
-                    .iter()
-                    .any(|(content, tags)| Some((content.as_str(), tags.as_slice())) == source_data)
+                versions.iter().any(|version| {
+                    let version = version.as_ref();
+                    version.map(|(content, tags)| (content.as_str(), tags.as_slice()))
+                        == source_data
+                })
             });
         if target_had_it {
             continue;
@@ -293,8 +293,8 @@ fn plan_merge<'a>(
 ///
 /// Every entry is compared three ways: base, source and target. A change made only on the source
 /// is applied to the target by appending events, so history is never rewritten. A change made
-/// only on the target is kept, and so is a target that already held the source's version and has
-/// changed it since. An entry changed differently on both sides is a conflict: it is left alone
+/// only on the target is kept, and so is a target that already held the source's version (or its
+/// deletion) since the base and has changed it again; such entries are not listed in the report. An entry changed differently on both sides is a conflict: it is left alone
 /// and reported. After a merge, a reported conflict counts as settled in favor of the target; to
 /// take the source's version, update the target's entry (or add it again if the target deleted
 /// it).

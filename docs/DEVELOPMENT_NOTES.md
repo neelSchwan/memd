@@ -84,15 +84,17 @@ target's entry, or add it again if the target deleted it.
 
 **A version the target already held since the base is not re-applied.** Changes can reach a target
 through a third volume (left → main → right). The base between left and right is still their fork
-point, so without this rule merging left into right directly would undo right's later deletions
-and reverts. "Since the base" is measured in time: clones copy events with their original
-timestamps, so target events newer than the base are the target's own. This also makes rolling a
-target back to before a merge stick.
+point, so without this rule merging left into right directly would undo right's later edits,
+deletions and restores. Deletions count as versions too. "Since the base" is measured in time:
+clones copy events with their original timestamps, so target events newer than the base are the
+target's own. Entries skipped this way are not listed in the merge report.
 
 **The v4 migration links clones in a loop, not a recursive query.** A clone always has a larger id
 than its source, so going through volumes in id order lets each clone copy its source's
-already-set origins with one indexed `UPDATE`. The first version used a recursive CTE and took
-minutes on a 10,000-entry clone chain; `migration_links_long_clone_chains_quickly` guards this.
+already-set origins. Each clone's copied puts are paired with their source puts in one join on the
+`(volume_id, seq)` primary key, then updated by id. A recursive CTE took minutes on a 10,000-entry
+clone chain, and a correlated `UPDATE` was still quadratic per volume.
+`migration_links_long_clone_chains_quickly` (5,000 entries, two clone levels) fails on both.
 
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.

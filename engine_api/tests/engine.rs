@@ -1160,7 +1160,7 @@ fn changes_that_arrived_through_another_volume_are_not_reapplied() {
 fn migration_links_long_clone_chains_quickly() {
     let conn = db();
     let mut volume = create_volume(&conn, "root".into()).unwrap().id();
-    for i in 0..1000 {
+    for i in 0..5000 {
         add_entry(
             &conn,
             volume,
@@ -1170,7 +1170,7 @@ fn migration_links_long_clone_chains_quickly() {
         )
         .unwrap();
     }
-    for depth in 0..4 {
+    for depth in 0..2 {
         let snap = snapshot(&conn, volume, format!("level {depth}")).unwrap();
         volume = clone_volume(&conn, snap.id(), None).unwrap().id();
     }
@@ -1183,7 +1183,27 @@ fn migration_links_long_clone_chains_quickly() {
 
     let started = std::time::Instant::now();
     init_db(&conn).unwrap();
-    // The first version of this migration took minutes on a chain like this one.
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // Linear work takes well under a second here; earlier quadratic versions took many seconds.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(diff_volumes(&conn, 1, volume).unwrap().is_empty());
+}
+
+#[test]
+fn deletions_that_arrived_through_another_volume_are_not_reapplied() {
+    let conn = db();
+    let (main, left, snap) = main_and_branch(&conn);
+    let right = clone_volume(&conn, snap.id(), Some("right".into()))
+        .unwrap()
+        .id();
+    let before_merge = snapshot(&conn, right, "before merge".into()).unwrap();
+
+    // Left's delete reaches right through main; right then rolls back to get the entry again.
+    delete_entry(&conn, entry_id_with(&conn, left, "shared fact")).unwrap();
+    merge_volumes(&conn, left, main, false).unwrap();
+    merge_volumes(&conn, main, right, false).unwrap();
+    rollback_to_snapshot(&conn, before_merge.id()).unwrap();
+
+    let report = merge_volumes(&conn, left, right, false).unwrap();
+    assert_eq!(report.events_appended, 0);
+    assert_eq!(live(&conn, right), ["shared fact"]);
 }

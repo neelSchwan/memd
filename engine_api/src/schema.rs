@@ -125,23 +125,29 @@ fn link_existing_clones(tx: &Transaction) -> Result<()> {
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?
     };
+    // Both events are looked up by (volume_id, seq), the primary key, so this is one pass over
+    // each clone's copied events.
+    let mut copied_puts = tx.prepare(
+        "SELECT clone_ev.entry_id, COALESCE(source.origin_entry_id, source.id)
+            FROM events clone_ev
+            JOIN events source_ev ON source_ev.volume_id = ?2 AND source_ev.seq = clone_ev.seq
+            JOIN entries source ON source.id = source_ev.entry_id
+            WHERE clone_ev.volume_id = ?1
+                AND clone_ev.seq <= ?3
+                AND clone_ev.event_type = 'put_entry'
+                AND source_ev.event_type = 'put_entry'
+                AND clone_ev.content IS source_ev.content",
+    )?;
+    let mut set_origin = tx.prepare("UPDATE entries SET origin_entry_id = ?2 WHERE id = ?1")?;
     for (clone_id, source_id, fork_seq) in clones {
-        tx.execute(
-            "UPDATE entries SET origin_entry_id = (
-                SELECT COALESCE(source.origin_entry_id, source.id)
-                FROM events clone_ev
-                JOIN events source_ev ON source_ev.volume_id = ?2 AND source_ev.seq = clone_ev.seq
-                JOIN entries source ON source.id = source_ev.entry_id
-                WHERE clone_ev.volume_id = ?1
-                    AND clone_ev.entry_id = entries.id
-                    AND clone_ev.event_type = 'put_entry'
-                    AND source_ev.event_type = 'put_entry'
-                    AND clone_ev.seq <= ?3
-                    AND clone_ev.content IS source_ev.content
-            )
-            WHERE volume_id = ?1",
-            (clone_id, source_id, fork_seq),
-        )?;
+        let pairs: Vec<(i64, i64)> = copied_puts
+            .query_map((clone_id, source_id, fork_seq), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (entry_id, origin) in pairs {
+            set_origin.execute((entry_id, origin))?;
+        }
     }
     Ok(())
 }
