@@ -34,9 +34,19 @@ to an empty volume.
 **Search uses FTS5.** `entries_fts` is a standalone FTS5 table (it keeps its own copy of the
 content) kept in sync with `entries` by triggers. Because the triggers live on the projection,
 search follows updates, rollbacks and `rebuild_projection` with no extra code. The query is split
-into words, each quoted and prefix-matched, and the words are OR'ed together and ranked with
-`bm25`. Quoting means FTS5 operators typed by a user or an agent can never cause a syntax error.
-OR rather than AND because agents tend to search with several loosely related keywords.
+on whitespace, each word is quoted and prefix-matched, and the words are OR'ed together and
+ranked with `bm25`. Quoting means FTS5 operators typed by a user or an agent can never cause a
+syntax error, and FTS5's own tokenizer decides what a word is inside each quoted term, so the two
+can't disagree. OR rather than AND because agents tend to search with several loosely related
+keywords.
+
+Known limitation: the index covers every volume and keeps deleted entries, so `bm25`'s word
+statistics are global. A volume full of one word can change the ranking order in another volume.
+Matching is unaffected. If this matters, add an `UNINDEXED` volume column to the index.
+
+**Migrations take the write lock before reading the version.** The MCP server and the CLI often
+start together. Without the lock, both read the old version and the second one fails to re-create
+tables. `processes_starting_together_migrate_once` covers it.
 
 **Write transactions are IMMEDIATE.** Every write reads before it writes (for example, to find the
 next seq). In WAL mode a deferred transaction fails with "database is locked" if another connection
@@ -90,4 +100,5 @@ printf '%s\n' \
 ### 2026-10-19: Full-text search
 
 - `search` now uses an FTS5 index (schema v2) with prefix matching and `bm25` ranking.
-- `migrate` applies steps from a `MIGRATIONS` list, so future schema changes are one entry each.
+- Review found that two processes upgrading the same database at once could fail; `migrate` now
+  takes the write lock first and re-reads the version.

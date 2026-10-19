@@ -1,8 +1,8 @@
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::{EngineError, Result};
 
-/// Bump this and add a step to `MIGRATIONS` whenever the schema changes.
+/// Bump this and add a step to `migrate` whenever the schema changes.
 pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
@@ -95,9 +95,6 @@ const MIGRATE_V1_TO_V2: &str = "
     END;
 ";
 
-/// Steps after v1, applied in order. Each brings the schema up to the version it is paired with.
-const MIGRATIONS: &[(i64, &str)] = &[(2, MIGRATE_V1_TO_V2)];
-
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -107,18 +104,25 @@ fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
 /// Brings the database up to `SCHEMA_VERSION`, creating it if empty.
 /// Refuses databases written by a newer version of memd rather than guessing at their schema.
 pub fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == SCHEMA_VERSION {
+    // Common case: already current, so no write lock is needed.
+    if schema_version(conn)? == SCHEMA_VERSION {
         return Ok(());
     }
+
+    // Take the write lock, then read the version again: another process starting at the same
+    // time may have migrated the database while this one was waiting.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let version = schema_version(&tx)?;
     if version > SCHEMA_VERSION {
         return Err(EngineError::UnsupportedSchemaVersion(version));
     }
-
-    let tx = conn.unchecked_transaction()?;
     if version < 1 {
         if table_exists(&tx, "events")? {
             tx.execute_batch(MIGRATE_V0_TO_V1)?;
@@ -126,10 +130,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(SCHEMA_V1)?;
         }
     }
-    for (target, sql) in MIGRATIONS {
-        if version < *target {
-            tx.execute_batch(sql)?;
-        }
+    if version < 2 {
+        tx.execute_batch(MIGRATE_V1_TO_V2)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

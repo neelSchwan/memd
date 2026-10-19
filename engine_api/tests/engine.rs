@@ -166,6 +166,29 @@ fn search_follows_updates_deletes_and_volumes() {
 }
 
 #[test]
+fn search_follows_clones_and_rollbacks() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    let snap = snapshot(&conn, vol.id(), "s".into()).unwrap();
+
+    let branch = clone_volume(&conn, snap.id(), None).unwrap();
+    assert_eq!(
+        search(&conn, branch.id(), "sqlite".into()).unwrap().len(),
+        1
+    );
+
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    rollback_to_snapshot(&conn, snap.id()).unwrap();
+    assert_eq!(search(&conn, vol.id(), "sqlite".into()).unwrap().len(), 1);
+    assert!(
+        search(&conn, vol.id(), "postgres".into())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn snapshot_of_empty_volume_is_valid() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
@@ -445,7 +468,75 @@ fn concurrent_writers_on_one_file_all_succeed() {
         .collect();
     assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
 
+    remove_database_files(&path);
+}
+
+/// Path of a fresh v1 database file (the schema before the full-text index) holding one volume
+/// whose only entry was updated from "uses sqlite" to "uses postgres".
+fn v1_database_file(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("memd-{name}-{}.db", std::process::id()));
+    remove_database_files(&path);
+    let conn = open_db(&path).unwrap();
+    let vol = create_volume(&conn, "legacy".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER entries_fts_insert;
+         DROP TRIGGER entries_fts_update;
+         DROP TABLE entries_fts;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    path
+}
+
+fn remove_database_files(path: &std::path::Path) {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[test]
+fn migrates_v1_database_and_indexes_current_content() {
+    let path = v1_database_file("v1-upgrade");
+    let conn = open_db(&path).unwrap();
+
+    assert_eq!(
+        contents(&search(&conn, 1, "postgres".into()).unwrap()),
+        ["uses postgres"]
+    );
+    assert!(search(&conn, 1, "sqlite".into()).unwrap().is_empty());
+
+    drop(conn);
+    remove_database_files(&path);
+}
+
+#[test]
+fn processes_starting_together_migrate_once() {
+    let path = v1_database_file("v1-race");
+
+    // Hold the write lock so every opener reads version 1 and then queues behind it.
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let openers: Vec<_> = (0..3)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || open_db(&path).map(drop))
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    blocker.execute_batch("COMMIT").unwrap();
+
+    for opener in openers {
+        opener.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        search(&open_db(&path).unwrap(), 1, "postgres".into())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(blocker);
+    remove_database_files(&path);
 }

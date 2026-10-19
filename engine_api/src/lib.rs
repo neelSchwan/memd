@@ -735,13 +735,12 @@ pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>
 
 /// Turns free text into an FTS5 query that matches entries containing any of its words,
 /// including words that start with them ("auth" matches "authentication").
-/// Each word is quoted, so FTS5 operators and punctuation in the input are treated as text.
-/// Returns None when the text has no words.
+/// Each word is quoted, so FTS5 operators in the input are matched as plain text, and FTS5's
+/// own tokenizer decides what counts as a word. Returns None when the text has no words.
 fn fts_query(text: &str) -> Option<String> {
     let terms: Vec<String> = text
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(|word| format!("\"{word}\"*"))
+        .split_whitespace()
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
         .collect();
     (!terms.is_empty()).then(|| terms.join(" OR "))
 }
@@ -750,7 +749,7 @@ fn fts_query(text: &str) -> Option<String> {
 /// Matching is case-insensitive and word-based; see `fts_query`.
 pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<Vec<Entry>> {
     get_volume(conn, volume_id)?;
-    let Some(fts_query) = fts_query(&query) else {
+    let Some(match_expr) = fts_query(&query) else {
         return Ok(Vec::new());
     };
     let mut stmt = conn.prepare(&format!(
@@ -762,7 +761,7 @@ pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<V
             ORDER BY rank, id"
     ))?;
     let rows = stmt
-        .query_map((volume_id, fts_query), EntryRow::from_row)?
+        .query_map((volume_id, match_expr), EntryRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter().map(EntryRow::into_entry).collect()
 }
