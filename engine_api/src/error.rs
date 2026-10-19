@@ -17,6 +17,8 @@ pub enum EngineError {
         from: SnapshotId,
         to: SnapshotId,
     },
+    /// The database was created by a newer version of memd.
+    UnsupportedSchemaVersion(i64),
     /// Stored data that cannot be interpreted, e.g. an event log that does not replay.
     Corrupt(String),
     Sqlite(rusqlite::Error),
@@ -36,6 +38,10 @@ impl fmt::Display for EngineError {
             EngineError::SnapshotVolumeMismatch { from, to } => {
                 write!(f, "snapshots {from} and {to} belong to different volumes")
             }
+            EngineError::UnsupportedSchemaVersion(version) => write!(
+                f,
+                "database schema version {version} is newer than this build supports; upgrade memd"
+            ),
             EngineError::Corrupt(msg) => write!(f, "corrupt data: {msg}"),
             EngineError::Sqlite(e) => write!(f, "database error: {e}"),
         }

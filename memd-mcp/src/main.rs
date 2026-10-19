@@ -224,7 +224,7 @@ impl MemdServer {
         let request = params.0;
 
         let events = match request.entry_id {
-            Some(entry_id) => engine_api::entry_history(&conn, entry_id),
+            Some(entry_id) => engine_api::entry_history(&conn, request.volume_id, entry_id),
             None => engine_api::list_events(&conn, request.volume_id),
         }
         .map_err(|e| e.to_string())?;

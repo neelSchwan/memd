@@ -86,7 +86,7 @@ enum EntryCommands {
     Search { volume_id: i64, query: String },
 
     /// Show every change made to an entry
-    History { entry_id: i64 },
+    History { volume_id: i64, entry_id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -193,7 +193,10 @@ fn run(cli: Cli) -> engine_api::Result<()> {
             EntryCommands::Search { volume_id, query } => {
                 print_entries(&search(&conn, volume_id, query)?)
             }
-            EntryCommands::History { entry_id } => print_events(&entry_history(&conn, entry_id)?),
+            EntryCommands::History {
+                volume_id,
+                entry_id,
+            } => print_events(&entry_history(&conn, volume_id, entry_id)?),
         },
         Commands::Snapshot { command } => match command {
             SnapshotCommands::Create { volume_id, label } => {

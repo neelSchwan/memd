@@ -34,6 +34,15 @@ to an empty volume.
 **Search uses `instr(lower(...))`, not `LIKE`.** `LIKE` treated `%` and `_` in user queries as
 wildcards.
 
+**Write transactions are IMMEDIATE.** Every write reads before it writes (for example, to find the
+next seq). In WAL mode a deferred transaction fails with "database is locked" if another connection
+commits in between, and the busy timeout doesn't help. Taking the write lock up front avoids this,
+and the CLI and MCP server can share a database. `concurrent_writers_on_one_file_all_succeed`
+covers it.
+
+**Newer databases are refused.** `migrate` returns `UnsupportedSchemaVersion` when the database
+is newer than the build, instead of quietly marking it with an older version.
+
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.
 
@@ -71,3 +80,6 @@ printf '%s\n' \
 - Removed unused dependencies (`serde_json`, and `rusqlite` from `memd-mcp`, which now uses
   `engine_api::Connection`).
 - Added `CLAUDE.md` (guidelines), this file, CI, and the `pr-reviewer` agent.
+- The `pr-reviewer` agent's first review found that concurrent writers could fail with "database
+  is locked", and that newer schema versions were overwritten. Both are fixed and have regression
+  tests. `entry_history` now also takes the volume id and rejects entries from other volumes.

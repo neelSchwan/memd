@@ -47,7 +47,7 @@ fn add_update_delete_are_logged_and_projected() {
         ]
     );
 
-    let history = entry_history(&conn, a.id()).unwrap();
+    let history = entry_history(&conn, vol.id(), a.id()).unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[1].content(), Some("uses postgres"));
 }
@@ -342,4 +342,60 @@ fn migrates_v0_database() {
     update_entry(&conn, 1, "new fact".into()).unwrap();
     rollback_to_snapshot(&conn, 1).unwrap();
     assert_eq!(contents(&list_entries(&conn, 1).unwrap()), ["old fact"]);
+}
+
+#[test]
+fn refuses_database_from_newer_version() {
+    let conn = db();
+    conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+        .unwrap();
+
+    assert!(matches!(
+        init_db(&conn),
+        Err(EngineError::UnsupportedSchemaVersion(_))
+    ));
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION + 1);
+}
+
+#[test]
+fn concurrent_writers_on_one_file_all_succeed() {
+    let path = std::env::temp_dir().join(format!("memd-concurrency-{}.db", std::process::id()));
+    let volume_id = create_volume(&open_db(&path).unwrap(), "shared".into())
+        .unwrap()
+        .id();
+
+    let writers: Vec<_> = (0..4)
+        .map(|writer| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let conn = open_db(&path).unwrap();
+                for i in 0..25 {
+                    add_entry(
+                        &conn,
+                        volume_id,
+                        format!("{writer}-{i}"),
+                        EntrySource::Agent,
+                    )
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+
+    let seqs: Vec<_> = list_events(&open_db(&path).unwrap(), volume_id)
+        .unwrap()
+        .iter()
+        .map(|e| e.seq())
+        .collect();
+    assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

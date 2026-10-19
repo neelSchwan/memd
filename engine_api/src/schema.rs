@@ -1,6 +1,6 @@
 use rusqlite::{Connection, Transaction};
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 
 /// Bump this and add a step to `migrate` whenever the schema changes.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -91,10 +91,17 @@ fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
 }
 
 /// Brings the database up to `SCHEMA_VERSION`, creating it if empty.
+/// Refuses databases written by a newer version of memd rather than guessing at their schema.
 pub fn migrate(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        return Err(EngineError::UnsupportedSchemaVersion(version));
+    }
 
+    let tx = conn.unchecked_transaction()?;
     if version < 1 {
         if table_exists(&tx, "events")? {
             tx.execute_batch(MIGRATE_V0_TO_V1)?;

@@ -10,7 +10,7 @@ You review changes to the memd repository. You do not edit files; you report fin
 
 1. Read `CLAUDE.md` in the repository root. It is the standard you review against.
 2. Get the diff. If you were given a PR number or branch, diff it against the base branch
-   (`git diff origin/main...HEAD` or similar). Otherwise review uncommitted and unpushed changes.
+   (`git diff master...HEAD`; `master` is the default branch). Otherwise review uncommitted and unpushed changes.
 3. Run the checks and report any failure verbatim:
    ```bash
    cargo fmt --all --check

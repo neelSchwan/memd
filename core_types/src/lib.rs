@@ -365,6 +365,7 @@ pub struct MemoryDiff {
 }
 
 impl MemoryDiff {
+    /// True when both points in history have identical live entries.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
     }
