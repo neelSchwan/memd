@@ -58,7 +58,8 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-/// Tags are stored as one comma-separated string. Commas can't appear in a tag.
+/// In the database, tags are stored as one comma-separated string (commas can't appear in a tag).
+/// Everywhere else they are a list; these two convert at the boundary.
 fn join_tags(tags: &[String]) -> String {
     tags.join(",")
 }
@@ -71,11 +72,11 @@ fn split_tags(stored: &str) -> Vec<String> {
     }
 }
 
-/// The part of an entry that put, update and restore events carry. `tags` is in stored form.
+/// The part of an entry that put, update and restore events carry.
 #[derive(Clone, Copy)]
 struct EntryData<'a> {
     content: &'a str,
-    tags: &'a str,
+    tags: &'a [String],
 }
 
 const ENTRY_COLS: &str = "id, volume_id, content, tags, created_at, updated_at, source, deleted";
@@ -84,7 +85,7 @@ struct EntryRow {
     id: EntryId,
     volume_id: VolumeId,
     content: String,
-    tags: String,
+    tags: Vec<String>,
     created_at: String,
     updated_at: String,
     source: String,
@@ -97,7 +98,7 @@ impl EntryRow {
             id: row.get(0)?,
             volume_id: row.get(1)?,
             content: row.get(2)?,
-            tags: row.get(3)?,
+            tags: split_tags(&row.get::<_, String>(3)?),
             created_at: row.get(4)?,
             updated_at: row.get(5)?,
             source: row.get(6)?,
@@ -116,7 +117,7 @@ impl EntryRow {
             self.id,
             self.volume_id,
             self.content,
-            split_tags(&self.tags),
+            self.tags,
             created_at,
             updated_at,
             self.source.parse()?,
@@ -132,7 +133,7 @@ struct EventRow {
     event_type: String,
     entry_id: EntryId,
     content: Option<String>,
-    tags: String,
+    tags: Vec<String>,
     source: Option<String>,
     created_at: String,
 }
@@ -145,7 +146,7 @@ impl EventRow {
             event_type: row.get(2)?,
             entry_id: row.get(3)?,
             content: row.get(4)?,
-            tags: row.get(5)?,
+            tags: split_tags(&row.get::<_, String>(5)?),
             source: row.get(6)?,
             created_at: row.get(7)?,
         })
@@ -159,7 +160,7 @@ impl EventRow {
             self.event_type.parse()?,
             self.entry_id,
             self.content,
-            split_tags(&self.tags),
+            self.tags,
             source,
             parse_datetime(&self.created_at)?,
         )?)
@@ -264,7 +265,14 @@ fn insert_entry_row(
     conn.execute(
         "INSERT INTO entries (volume_id, content, tags, created_at, updated_at, source, origin_entry_id)
             VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
-        (volume_id, data.content, data.tags, at, source.as_str(), origin),
+        (
+            volume_id,
+            data.content,
+            join_tags(data.tags),
+            at,
+            source.as_str(),
+            origin,
+        ),
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -356,7 +364,7 @@ fn append_event(
             event_type.as_str(),
             entry_id,
             data.map(|d| d.content),
-            data.map_or("", |d| d.tags),
+            data.map_or(String::new(), |d| join_tags(d.tags)),
             source.map(|s| s.as_str()),
             at,
         ),
@@ -381,7 +389,7 @@ fn project_event(
                     WHERE id = ?4",
                 (
                     data.map(|d| d.content),
-                    data.map_or("", |d| d.tags),
+                    data.map_or(String::new(), |d| join_tags(d.tags)),
                     at,
                     entry_id,
                 ),
@@ -441,8 +449,7 @@ fn create_volume_inner(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplayedEntry {
     content: String,
-    /// Stored form, see `join_tags`.
-    tags: String,
+    tags: Vec<String>,
     source: EntrySource,
     created_at: String,
     updated_at: String,
@@ -465,7 +472,7 @@ fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
             ))
         };
         let content = || ev.content().unwrap_or_default().to_string();
-        let tags = || join_tags(ev.tags());
+        let tags = || ev.tags().to_vec();
 
         match ev.event_type() {
             EventType::PutEntry => {
@@ -535,7 +542,7 @@ fn live_entries(
                 id,
                 volume_id,
                 e.content,
-                split_tags(&e.tags),
+                e.tags,
                 parse_datetime(&e.created_at)?,
                 parse_datetime(&e.updated_at)?,
                 e.source,
@@ -586,7 +593,7 @@ fn rebuild_projection_inner(conn: &Connection, volume_id: VolumeId) -> Result<us
                             WHERE id = ?7",
                         (
                             &replayed.content,
-                            &replayed.tags,
+                            join_tags(&replayed.tags),
                             replayed.source.as_str(),
                             &replayed.created_at,
                             &replayed.updated_at,
@@ -666,16 +673,15 @@ pub fn clone_volume(
     let mut new_entry_ids: HashMap<EntryId, EntryId> = HashMap::new();
     for ev in &events {
         let at = ev.created_at().to_rfc3339();
-        let tags = join_tags(ev.tags());
         let data = ev.content().map(|content| EntryData {
             content,
-            tags: &tags,
+            tags: ev.tags(),
         });
         if ev.event_type() == EventType::PutEntry {
             let source = ev.source().unwrap_or(EntrySource::User);
             let row = EntryData {
                 content: ev.content().unwrap_or_default(),
-                tags: &tags,
+                tags: ev.tags(),
             };
             let origin = origins.get(&ev.entry_id()).copied();
             let new_id = insert_entry_row(&tx, new_volume.id(), row, source, &at, origin)?;
@@ -736,10 +742,9 @@ pub fn add_entry(
 
     let now = Utc::now();
     let at = now.to_rfc3339();
-    let stored_tags = join_tags(&tags);
     let data = EntryData {
         content: &content,
-        tags: &stored_tags,
+        tags: &tags,
     };
     let entry_id = insert_entry_row(&tx, volume_id, data, source, &at, None)?;
     append_event(
@@ -800,7 +805,7 @@ pub fn edit_entry(
         return Err(EngineError::EntryDeleted(entry_id));
     }
     let content = new_content.unwrap_or_else(|| row.content.clone());
-    let tags = new_tags.map_or_else(|| row.tags.clone(), |tags| join_tags(&tags));
+    let tags = new_tags.unwrap_or_else(|| row.tags.clone());
     if content != row.content || tags != row.tags {
         let at = now();
         let data = EntryData {
@@ -1059,12 +1064,10 @@ pub fn rollback_to_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Resul
     let at = now();
     let mut events_appended = 0;
     for (id, cur) in &current {
-        let wanted = target
-            .get(id)
-            .map(|want| (want.content(), join_tags(want.tags())));
-        let event_type = match &wanted {
+        let wanted = target.get(id).map(|want| (want.content(), want.tags()));
+        let event_type = match wanted {
             Some(_) if cur.deleted => Some(EventType::RestoreEntry),
-            Some((content, tags)) if cur.content != *content || cur.tags != *tags => {
+            Some((content, tags)) if cur.content != content || cur.tags != tags => {
                 Some(EventType::UpdateEntry)
             }
             Some(_) => None,
@@ -1072,9 +1075,7 @@ pub fn rollback_to_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Resul
             None => None,
         };
         if let Some(event_type) = event_type {
-            let data = wanted
-                .as_ref()
-                .map(|(content, tags)| EntryData { content, tags });
+            let data = wanted.map(|(content, tags)| EntryData { content, tags });
             append_event(&tx, volume_id, event_type, *id, data, None, &at)?;
             project_event(&tx, event_type, *id, data, &at)?;
             events_appended += 1;
