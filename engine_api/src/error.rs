@@ -17,6 +17,11 @@ pub enum EngineError {
         from: SnapshotId,
         to: SnapshotId,
     },
+    /// Merge needs volumes that share history through cloning.
+    VolumesNotRelated {
+        source: VolumeId,
+        target: VolumeId,
+    },
     /// The database was created by a newer version of memd.
     UnsupportedSchemaVersion(i64),
     /// Stored data that cannot be interpreted, e.g. an event log that does not replay.
@@ -38,6 +43,10 @@ impl fmt::Display for EngineError {
             EngineError::SnapshotVolumeMismatch { from, to } => {
                 write!(f, "snapshots {from} and {to} belong to different volumes")
             }
+            EngineError::VolumesNotRelated { source, target } => write!(
+                f,
+                "volumes {source} and {target} share no history; only volumes related by cloning can be merged"
+            ),
             EngineError::UnsupportedSchemaVersion(version) => write!(
                 f,
                 "database schema version {version} is newer than this build supports; upgrade memd"

@@ -6,6 +6,7 @@
 //! the log, so branching, diffing and rollback are all just replays.
 
 mod error;
+mod merge;
 mod schema;
 
 use chrono::{DateTime, Utc};
@@ -18,6 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub use error::{EngineError, Result};
+pub use merge::{diff_volumes, merge_volumes};
 // Re-exported so frontends can hold a connection without depending on rusqlite directly.
 pub use rusqlite::Connection;
 pub use schema::SCHEMA_VERSION;
@@ -250,19 +252,60 @@ fn load_entry_row(conn: &Connection, entry_id: EntryId) -> Result<EntryRow> {
 }
 
 /// Inserts the projection row for a new entry and returns its id.
+/// `origin` is the entry this one is a copy of (see `entry_origins`), or None for a new entry.
 fn insert_entry_row(
     conn: &Connection,
     volume_id: VolumeId,
     data: EntryData,
     source: EntrySource,
     at: &str,
+    origin: Option<EntryId>,
 ) -> Result<EntryId> {
     conn.execute(
-        "INSERT INTO entries (volume_id, content, tags, created_at, updated_at, source)
-            VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
-        (volume_id, data.content, data.tags, at, source.as_str()),
+        "INSERT INTO entries (volume_id, content, tags, created_at, updated_at, source, origin_entry_id)
+            VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6)",
+        (volume_id, data.content, data.tags, at, source.as_str(), origin),
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Maps every entry id of a volume (deleted entries included) to its origin: the id of the
+/// original entry it was copied from by cloning or merging, or its own id if it is an original.
+/// The same entry has the same origin in a volume and in all of its branches.
+fn entry_origins(conn: &Connection, volume_id: VolumeId) -> Result<HashMap<EntryId, EntryId>> {
+    let mut stmt =
+        conn.prepare("SELECT id, COALESCE(origin_entry_id, id) FROM entries WHERE volume_id = ?1")?;
+    let origins = stmt
+        .query_map([volume_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(origins)
+}
+
+/// The content and tags of an entry, the parts diff and merge compare. None for no entry.
+fn entry_data(entry: Option<&Entry>) -> Option<(&str, &[String])> {
+    entry.map(|entry| (entry.content(), entry.tags()))
+}
+
+/// Compares two sets of entries keyed the same way and returns (added, removed, modified).
+fn compare_states(
+    before: BTreeMap<EntryId, Entry>,
+    mut after: BTreeMap<EntryId, Entry>,
+) -> (Vec<Entry>, Vec<Entry>, Vec<EntryModification>) {
+    let mut removed = Vec::new();
+    let mut modified = Vec::new();
+    for (key, old) in before {
+        match after.remove(&key) {
+            None => removed.push(old),
+            Some(new) if entry_data(Some(&new)) != entry_data(Some(&old)) => {
+                modified.push(EntryModification {
+                    before: old,
+                    after: new,
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    (after.into_values().collect(), removed, modified)
 }
 
 /// Returns `<base>`, or `<base>_2`, `<base>_3`, ... for the first name no volume uses yet.
@@ -617,6 +660,7 @@ pub fn clone_volume(
     let new_volume = create_volume_inner(&tx, name, Some(snapshot_id))?;
 
     let events = load_events(&tx, source.id(), Some(snap.event_seq_pointer()))?;
+    let origins = entry_origins(&tx, source.id())?;
 
     // Entry ids are global, so each copied entry gets a new id in the clone.
     let mut new_entry_ids: HashMap<EntryId, EntryId> = HashMap::new();
@@ -633,7 +677,8 @@ pub fn clone_volume(
                 content: ev.content().unwrap_or_default(),
                 tags: &tags,
             };
-            let new_id = insert_entry_row(&tx, new_volume.id(), row, source, &at)?;
+            let origin = origins.get(&ev.entry_id()).copied();
+            let new_id = insert_entry_row(&tx, new_volume.id(), row, source, &at, origin)?;
             new_entry_ids.insert(ev.entry_id(), new_id);
         }
         let entry_id = *new_entry_ids.get(&ev.entry_id()).ok_or_else(|| {
@@ -696,7 +741,7 @@ pub fn add_entry(
         content: &content,
         tags: &stored_tags,
     };
-    let entry_id = insert_entry_row(&tx, volume_id, data, source, &at)?;
+    let entry_id = insert_entry_row(&tx, volume_id, data, source, &at, None)?;
     append_event(
         &tx,
         volume_id,
@@ -954,28 +999,17 @@ pub fn diff(
     to_seq: SeqNumber,
 ) -> Result<MemoryDiff> {
     get_volume(conn, volume_id)?;
-    let before = state_map_at(conn, volume_id, from_seq)?;
-    let mut after = state_map_at(conn, volume_id, to_seq)?;
-
-    let mut result = MemoryDiff {
+    let (added, removed, modified) = compare_states(
+        state_map_at(conn, volume_id, from_seq)?,
+        state_map_at(conn, volume_id, to_seq)?,
+    );
+    Ok(MemoryDiff {
         from_seq,
         to_seq,
-        ..MemoryDiff::default()
-    };
-    for (id, old) in before {
-        match after.remove(&id) {
-            None => result.removed.push(old),
-            Some(new) if new.content() != old.content() || new.tags() != old.tags() => {
-                result.modified.push(EntryModification {
-                    before: old,
-                    after: new,
-                })
-            }
-            Some(_) => {}
-        }
-    }
-    result.added = after.into_values().collect();
-    Ok(result)
+        added,
+        removed,
+        modified,
+    })
 }
 
 /// Compares a snapshot against a later (or earlier) snapshot of the same volume,

@@ -1,4 +1,4 @@
-use core_types::{EntrySource, EventType};
+use core_types::{EntrySource, EventType, VolumeId};
 use engine_api::Connection;
 use engine_api::*;
 
@@ -700,7 +700,7 @@ fn concurrent_writers_on_one_file_all_succeed() {
     remove_database_files(&path);
 }
 
-/// Path of a v1 database file (before the full-text index and tags) holding one volume whose
+/// Path of a v1 database file (before the full-text index, tags and entry origins) holding one volume whose
 /// only entry was updated from "uses sqlite" to "uses postgres". Built by creating a current
 /// database and undoing every later migration.
 fn v1_database_file(name: &str) -> std::path::PathBuf {
@@ -723,6 +723,8 @@ fn v1_database_file(name: &str) -> std::path::PathBuf {
          DROP TABLE entries_fts;
          ALTER TABLE entries DROP COLUMN tags;
          ALTER TABLE events DROP COLUMN tags;
+         ALTER TABLE entries DROP COLUMN origin_entry_id;
+         ALTER TABLE snapshots DROP COLUMN merged_into_volume_id;
          PRAGMA user_version = 1;",
     )
     .unwrap();
@@ -780,4 +782,428 @@ fn processes_starting_together_migrate_once() {
 
     drop(blocker);
     remove_database_files(&path);
+}
+
+/// A "main" volume with one entry, snapshotted and branched. Returns (main, branch, snapshot).
+fn main_and_branch(conn: &Connection) -> (VolumeId, VolumeId, core_types::Snapshot) {
+    let main = create_volume(conn, "main".into()).unwrap();
+    add_entry(
+        conn,
+        main.id(),
+        "shared fact".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
+    let snap = snapshot(conn, main.id(), "fork".into()).unwrap();
+    let branch = clone_volume(conn, snap.id(), Some("branch".into())).unwrap();
+    (main.id(), branch.id(), snap)
+}
+
+fn live(conn: &Connection, volume_id: VolumeId) -> Vec<String> {
+    list_entries(conn, volume_id, &[])
+        .unwrap()
+        .iter()
+        .map(|e| e.content().to_string())
+        .collect()
+}
+
+fn entry_id_with(conn: &Connection, volume_id: VolumeId, content: &str) -> core_types::EntryId {
+    list_entries(conn, volume_id, &[])
+        .unwrap()
+        .into_iter()
+        .find(|e| e.content() == content)
+        .unwrap()
+        .id()
+}
+
+#[test]
+fn clones_match_their_source_entry_by_entry() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    assert!(diff_volumes(&conn, main, branch).unwrap().is_empty());
+
+    let grandchild_snap = snapshot(&conn, branch, "again".into()).unwrap();
+    let grandchild = clone_volume(&conn, grandchild_snap.id(), None).unwrap();
+    assert!(
+        diff_volumes(&conn, main, grandchild.id())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn diff_volumes_matches_entries_across_branches() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    add_entry(
+        &conn,
+        branch,
+        "branch only".into(),
+        EntrySource::Agent,
+        vec![],
+    )
+    .unwrap();
+    update_entry(
+        &conn,
+        entry_id_with(&conn, main, "shared fact"),
+        "shared fact v2".into(),
+    )
+    .unwrap();
+
+    let diff = diff_volumes(&conn, main, branch).unwrap();
+    assert_eq!(contents(&diff.added), ["branch only"]);
+    assert!(diff.removed.is_empty());
+    assert_eq!(diff.modified.len(), 1);
+    assert_eq!(diff.modified[0].before.content(), "shared fact v2");
+    assert_eq!(diff.modified[0].after.content(), "shared fact");
+
+    let reverse = diff_volumes(&conn, branch, main).unwrap();
+    assert_eq!(contents(&reverse.removed), ["branch only"]);
+}
+
+#[test]
+fn merge_applies_branch_changes_without_rewriting_history() {
+    let conn = db();
+    let main = create_volume(&conn, "main".into()).unwrap().id();
+    add_entry(&conn, main, "shared fact".into(), EntrySource::User, vec![]).unwrap();
+    let doomed = add_entry(&conn, main, "doomed".into(), EntrySource::User, vec![]).unwrap();
+    let snap = snapshot(&conn, main, "fork".into()).unwrap();
+    let branch = clone_volume(&conn, snap.id(), None).unwrap().id();
+
+    add_entry(
+        &conn,
+        branch,
+        "new on branch".into(),
+        EntrySource::Agent,
+        tags(&["idea"]),
+    )
+    .unwrap();
+    update_entry(
+        &conn,
+        entry_id_with(&conn, branch, "shared fact"),
+        "refined fact".into(),
+    )
+    .unwrap();
+    delete_entry(&conn, entry_id_with(&conn, branch, "doomed")).unwrap();
+    add_entry(&conn, main, "main only".into(), EntrySource::User, vec![]).unwrap();
+    let main_log_before = list_events(&conn, main).unwrap().len();
+
+    let report = merge_volumes(&conn, branch, main, false).unwrap();
+    assert_eq!(contents(&report.added), ["new on branch"]);
+    assert_eq!(report.removed[0].id(), doomed.id());
+    assert_eq!(report.modified[0].after.content(), "refined fact");
+    assert!(report.conflicts.is_empty());
+    assert_eq!(report.events_appended, 3);
+
+    // The target's own change survives, and its old history is untouched.
+    assert_eq!(
+        live(&conn, main),
+        ["refined fact", "main only", "new on branch"]
+    );
+    assert_eq!(list_events(&conn, main).unwrap().len(), main_log_before + 3);
+    assert_eq!(rebuild_projection(&conn, main).unwrap(), 0);
+    let merged = list_entries(&conn, main, &tags(&["idea"])).unwrap();
+    assert_eq!(merged[0].source(), EntrySource::Agent);
+    assert_eq!(
+        contents(&diff_volumes(&conn, branch, main).unwrap().added),
+        ["main only"]
+    );
+}
+
+#[test]
+fn merge_dry_run_writes_nothing() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    add_entry(&conn, branch, "idea".into(), EntrySource::Agent, vec![]).unwrap();
+    let events_before = list_events(&conn, main).unwrap().len();
+    let snapshots_before = list_snapshots(&conn, branch).unwrap().len();
+
+    let preview = merge_volumes(&conn, branch, main, true).unwrap();
+    assert!(preview.dry_run);
+    assert_eq!(contents(&preview.added), ["idea"]);
+    assert_eq!(preview.events_appended, 1);
+    assert_eq!(list_events(&conn, main).unwrap().len(), events_before);
+    assert_eq!(
+        list_snapshots(&conn, branch).unwrap().len(),
+        snapshots_before
+    );
+
+    let real = merge_volumes(&conn, branch, main, false).unwrap();
+    assert_eq!(contents(&real.added), contents(&preview.added));
+}
+
+#[test]
+fn merge_skips_and_reports_conflicts() {
+    let conn = db();
+    let main = create_volume(&conn, "main".into()).unwrap().id();
+    for content in ["both edit", "edit vs delete", "untouched"] {
+        add_entry(&conn, main, content.into(), EntrySource::User, vec![]).unwrap();
+    }
+    let snap = snapshot(&conn, main, "fork".into()).unwrap();
+    let branch = clone_volume(&conn, snap.id(), None).unwrap().id();
+
+    update_entry(
+        &conn,
+        entry_id_with(&conn, main, "both edit"),
+        "main's edit".into(),
+    )
+    .unwrap();
+    update_entry(
+        &conn,
+        entry_id_with(&conn, branch, "both edit"),
+        "branch's edit".into(),
+    )
+    .unwrap();
+    delete_entry(&conn, entry_id_with(&conn, main, "edit vs delete")).unwrap();
+    update_entry(
+        &conn,
+        entry_id_with(&conn, branch, "edit vs delete"),
+        "kept on branch".into(),
+    )
+    .unwrap();
+    add_entry(
+        &conn,
+        branch,
+        "clean addition".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
+
+    let report = merge_volumes(&conn, branch, main, false).unwrap();
+    assert_eq!(report.conflicts.len(), 2);
+    let both = &report.conflicts[0];
+    assert_eq!(both.base.as_ref().unwrap().content(), "both edit");
+    assert_eq!(both.source.as_ref().unwrap().content(), "branch's edit");
+    assert_eq!(both.target.as_ref().unwrap().content(), "main's edit");
+    assert!(report.conflicts[1].target.is_none());
+
+    // Conflicting entries are left as they were; the clean change still lands.
+    assert_eq!(
+        live(&conn, main),
+        ["main's edit", "untouched", "clean addition"]
+    );
+}
+
+#[test]
+fn identical_changes_on_both_sides_are_not_conflicts() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    update_entry(
+        &conn,
+        entry_id_with(&conn, main, "shared fact"),
+        "same edit".into(),
+    )
+    .unwrap();
+    update_entry(
+        &conn,
+        entry_id_with(&conn, branch, "shared fact"),
+        "same edit".into(),
+    )
+    .unwrap();
+
+    let report = merge_volumes(&conn, branch, main, false).unwrap();
+    assert!(report.conflicts.is_empty());
+    assert_eq!(report.events_appended, 0);
+}
+
+#[test]
+fn repeated_merges_from_a_long_lived_branch() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    let shared = entry_id_with(&conn, branch, "shared fact");
+
+    update_entry(&conn, shared, "v2".into()).unwrap();
+    merge_volumes(&conn, branch, main, false).unwrap();
+    // Merging again with nothing new changes nothing.
+    assert_eq!(
+        merge_volumes(&conn, branch, main, false)
+            .unwrap()
+            .events_appended,
+        0
+    );
+
+    // Editing the same entry again is a plain change, not a conflict.
+    update_entry(&conn, shared, "v3".into()).unwrap();
+    let report = merge_volumes(&conn, branch, main, false).unwrap();
+    assert!(report.conflicts.is_empty());
+    assert_eq!(live(&conn, main), ["v3"]);
+
+    let note = add_entry(&conn, branch, "temporary".into(), EntrySource::User, vec![]).unwrap();
+    merge_volumes(&conn, branch, main, false).unwrap();
+    delete_entry(&conn, note.id()).unwrap();
+    merge_volumes(&conn, branch, main, false).unwrap();
+    assert_eq!(live(&conn, main), ["v3"]);
+}
+
+#[test]
+fn merge_parent_into_branch_and_between_siblings() {
+    let conn = db();
+    let (main, branch, snap) = main_and_branch(&conn);
+    let sibling = clone_volume(&conn, snap.id(), Some("sibling".into()))
+        .unwrap()
+        .id();
+
+    add_entry(&conn, main, "from main".into(), EntrySource::User, vec![]).unwrap();
+    merge_volumes(&conn, main, branch, false).unwrap();
+    assert_eq!(live(&conn, branch), ["shared fact", "from main"]);
+
+    add_entry(
+        &conn,
+        sibling,
+        "from sibling".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
+    merge_volumes(&conn, sibling, branch, false).unwrap();
+    assert_eq!(
+        live(&conn, branch),
+        ["shared fact", "from main", "from sibling"]
+    );
+}
+
+#[test]
+fn merge_restores_instead_of_duplicating() {
+    let conn = db();
+    let main = create_volume(&conn, "main".into()).unwrap().id();
+    let entry = add_entry(&conn, main, "comes back".into(), EntrySource::User, vec![]).unwrap();
+    let before_delete = snapshot(&conn, main, "before delete".into()).unwrap();
+    delete_entry(&conn, entry.id()).unwrap();
+    let after_delete = snapshot(&conn, main, "after delete".into()).unwrap();
+    // The branch starts with the entry already deleted.
+    let branch = clone_volume(&conn, after_delete.id(), None).unwrap().id();
+
+    rollback_to_snapshot(&conn, before_delete.id()).unwrap();
+    merge_volumes(&conn, main, branch, false).unwrap();
+
+    assert_eq!(live(&conn, branch), ["comes back"]);
+    let last_event = list_events(&conn, branch).unwrap().pop().unwrap();
+    assert_eq!(last_event.event_type(), EventType::RestoreEntry);
+}
+
+#[test]
+fn merging_unrelated_volumes_fails() {
+    let conn = db();
+    let a = create_volume(&conn, "a".into()).unwrap().id();
+    let b = create_volume(&conn, "b".into()).unwrap().id();
+    assert!(matches!(
+        merge_volumes(&conn, a, b, false),
+        Err(EngineError::VolumesNotRelated { .. })
+    ));
+}
+
+#[test]
+fn migration_links_existing_clones_to_their_origins() {
+    let conn = db();
+    let (main, branch, _) = main_and_branch(&conn);
+    add_entry(
+        &conn,
+        branch,
+        "branch only".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
+    let branch_snap = snapshot(&conn, branch, "again".into()).unwrap();
+    let grandchild = clone_volume(&conn, branch_snap.id(), None).unwrap().id();
+
+    // Turn the database back into v3, which had no entry origins.
+    conn.execute_batch(
+        "ALTER TABLE entries DROP COLUMN origin_entry_id;
+         ALTER TABLE snapshots DROP COLUMN merged_into_volume_id;
+         PRAGMA user_version = 3;",
+    )
+    .unwrap();
+    init_db(&conn).unwrap();
+
+    let diff = diff_volumes(&conn, main, branch).unwrap();
+    assert!(diff.removed.is_empty() && diff.modified.is_empty());
+    assert!(diff_volumes(&conn, branch, grandchild).unwrap().is_empty());
+    assert_eq!(
+        contents(&diff_volumes(&conn, main, grandchild).unwrap().added),
+        ["branch only"]
+    );
+    let report = merge_volumes(&conn, grandchild, main, false).unwrap();
+    assert_eq!(contents(&report.added), ["branch only"]);
+    assert_eq!(live(&conn, main), ["shared fact", "branch only"]);
+}
+
+#[test]
+fn changes_that_arrived_through_another_volume_are_not_reapplied() {
+    let conn = db();
+    let (main, left, snap) = main_and_branch(&conn);
+    let right = clone_volume(&conn, snap.id(), Some("right".into()))
+        .unwrap()
+        .id();
+    let shared = entry_id_with(&conn, left, "shared fact");
+
+    // Left's changes reach right through main.
+    add_entry(&conn, left, "from left".into(), EntrySource::User, vec![]).unwrap();
+    update_entry(&conn, shared, "edited on left".into()).unwrap();
+    merge_volumes(&conn, left, main, false).unwrap();
+    merge_volumes(&conn, main, right, false).unwrap();
+
+    // Right then deletes one and reverts the other.
+    delete_entry(&conn, entry_id_with(&conn, right, "from left")).unwrap();
+    let right_shared = entry_id_with(&conn, right, "edited on left");
+    update_entry(&conn, right_shared, "shared fact".into()).unwrap();
+
+    // Merging left into right directly must not undo right's later choices.
+    let report = merge_volumes(&conn, left, right, false).unwrap();
+    assert_eq!(report.events_appended, 0);
+    assert_eq!(live(&conn, right), ["shared fact"]);
+}
+
+#[test]
+fn migration_links_long_clone_chains_quickly() {
+    let conn = db();
+    let mut volume = create_volume(&conn, "root".into()).unwrap().id();
+    for i in 0..5000 {
+        add_entry(
+            &conn,
+            volume,
+            format!("fact {i}"),
+            EntrySource::User,
+            vec![],
+        )
+        .unwrap();
+    }
+    for depth in 0..2 {
+        let snap = snapshot(&conn, volume, format!("level {depth}")).unwrap();
+        volume = clone_volume(&conn, snap.id(), None).unwrap().id();
+    }
+    conn.execute_batch(
+        "ALTER TABLE entries DROP COLUMN origin_entry_id;
+         ALTER TABLE snapshots DROP COLUMN merged_into_volume_id;
+         PRAGMA user_version = 3;",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    init_db(&conn).unwrap();
+    // Linear work takes well under a second here; earlier quadratic versions took many seconds.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(diff_volumes(&conn, 1, volume).unwrap().is_empty());
+}
+
+#[test]
+fn deletions_that_arrived_through_another_volume_are_not_reapplied() {
+    let conn = db();
+    let (main, left, snap) = main_and_branch(&conn);
+    let right = clone_volume(&conn, snap.id(), Some("right".into()))
+        .unwrap()
+        .id();
+    let before_merge = snapshot(&conn, right, "before merge".into()).unwrap();
+
+    // Left's delete reaches right through main; right then rolls back to get the entry again.
+    delete_entry(&conn, entry_id_with(&conn, left, "shared fact")).unwrap();
+    merge_volumes(&conn, left, main, false).unwrap();
+    merge_volumes(&conn, main, right, false).unwrap();
+    rollback_to_snapshot(&conn, before_merge.id()).unwrap();
+
+    let report = merge_volumes(&conn, left, right, false).unwrap();
+    assert_eq!(report.events_appended, 0);
+    assert_eq!(live(&conn, right), ["shared fact"]);
 }

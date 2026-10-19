@@ -3,7 +3,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::error::{EngineError, Result};
 
 /// Bump this and add a step to `migrate` whenever the schema changes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = "
     CREATE TABLE volumes (
@@ -101,6 +101,57 @@ const MIGRATE_V2_TO_V3: &str = "
     ALTER TABLE events ADD COLUMN tags TEXT NOT NULL DEFAULT '';
 ";
 
+/// Entry origins, so the same entry can be recognized across a volume and its branches, and the
+/// merge bookmark on snapshots. Both are plain integers: entry rows are never deleted, so a foreign
+/// key would add nothing. Existing clones are linked up by `link_existing_clones`.
+const MIGRATE_V3_TO_V4: &str = "
+    ALTER TABLE entries ADD COLUMN origin_entry_id INTEGER;
+    ALTER TABLE snapshots ADD COLUMN merged_into_volume_id INTEGER;
+";
+
+/// Sets `origin_entry_id` on entries of volumes created by cloning before v4.
+///
+/// `clone_volume` copies a snapshot's events into the new volume in order, so a clone's put at
+/// seq N is a copy of its source's put at seq N; the content check guards that pairing. A clone
+/// always has a larger id than its source, so going through volumes in id order means the source's
+/// origins are already set, and a clone of a clone points straight at the original entry.
+fn link_existing_clones(tx: &Transaction) -> Result<()> {
+    let clones: Vec<(i64, i64, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT v.id, s.volume_id, s.event_seq_pointer
+                FROM volumes v JOIN snapshots s ON s.id = v.parent_snapshot_id
+                ORDER BY v.id",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    // Both events are looked up by (volume_id, seq), the primary key, so this is one pass over
+    // each clone's copied events.
+    let mut copied_puts = tx.prepare(
+        "SELECT clone_ev.entry_id, COALESCE(source.origin_entry_id, source.id)
+            FROM events clone_ev
+            JOIN events source_ev ON source_ev.volume_id = ?2 AND source_ev.seq = clone_ev.seq
+            JOIN entries source ON source.id = source_ev.entry_id
+            WHERE clone_ev.volume_id = ?1
+                AND clone_ev.seq <= ?3
+                AND clone_ev.event_type = 'put_entry'
+                AND source_ev.event_type = 'put_entry'
+                AND clone_ev.content IS source_ev.content",
+    )?;
+    let mut set_origin = tx.prepare("UPDATE entries SET origin_entry_id = ?2 WHERE id = ?1")?;
+    for (clone_id, source_id, fork_seq) in clones {
+        let pairs: Vec<(i64, i64)> = copied_puts
+            .query_map((clone_id, source_id, fork_seq), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (entry_id, origin) in pairs {
+            set_origin.execute((entry_id, origin))?;
+        }
+    }
+    Ok(())
+}
+
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -141,6 +192,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if version < 3 {
         tx.execute_batch(MIGRATE_V2_TO_V3)?;
+    }
+    if version < 4 {
+        tx.execute_batch(MIGRATE_V3_TO_V4)?;
+        link_existing_clones(&tx)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

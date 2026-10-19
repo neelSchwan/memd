@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
-use core_types::{Entry, EntrySource, Event, MemoryDiff};
+use core_types::{Entry, EntryModification, EntrySource, Event, MemoryDiff, MergeReport};
 use engine_api::{
-    add_entry, clone_volume, create_volume, delete_entry, diff_snapshots, entries_at_snapshot,
-    entry_history, list_entries, list_events, list_snapshots, list_volumes, open_db,
-    rebuild_projection, rollback_to_snapshot, search, snapshot, tag_entry, update_entry,
+    add_entry, clone_volume, create_volume, delete_entry, diff_snapshots, diff_volumes,
+    entries_at_snapshot, entry_history, list_entries, list_events, list_snapshots, list_volumes,
+    merge_volumes, open_db, rebuild_projection, rollback_to_snapshot, search, snapshot, tag_entry,
+    update_entry,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,6 +62,21 @@ enum VolumeCommands {
 
     /// Rebuild a volume's entries from its event log
     Rebuild { volume_id: i64 },
+
+    /// Compare the current entries of two volumes, e.g. a branch and its parent
+    Diff {
+        from_volume_id: i64,
+        to_volume_id: i64,
+    },
+
+    /// Apply the changes made on one volume to a related volume
+    Merge {
+        source_volume_id: i64,
+        target_volume_id: i64,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -158,16 +174,50 @@ fn print_events(events: &[Event]) {
 
 fn print_diff(diff: &MemoryDiff) {
     println!("seq {} -> {}", diff.from_seq, diff.to_seq);
-    if diff.is_empty() {
+    print_changes(&diff.added, &diff.removed, &diff.modified);
+}
+
+fn print_merge(report: &MergeReport) {
+    let applied_nothing =
+        report.added.is_empty() && report.removed.is_empty() && report.modified.is_empty();
+    if !applied_nothing || report.conflicts.is_empty() {
+        print_changes(&report.added, &report.removed, &report.modified);
+    }
+    let describe = |entry: &Option<Entry>| match entry {
+        Some(e) => with_tags(e.content(), e.tags()),
+        None => "(deleted)".to_string(),
+    };
+    for conflict in &report.conflicts {
+        println!("! conflict, left as is: {}", describe(&conflict.target));
+        println!("  source has: {}", describe(&conflict.source));
+    }
+    let verb = if report.dry_run {
+        "Would merge"
+    } else {
+        "Merged"
+    };
+    println!(
+        "{verb} volume {} into {}: {} events, {} conflicts skipped (base: volume {} seq {})",
+        report.source_volume_id,
+        report.target_volume_id,
+        report.events_appended,
+        report.conflicts.len(),
+        report.base_volume_id,
+        report.base_seq
+    );
+}
+
+fn print_changes(added: &[Entry], removed: &[Entry], modified: &[EntryModification]) {
+    if added.is_empty() && removed.is_empty() && modified.is_empty() {
         println!("(no changes)");
     }
-    for e in &diff.added {
+    for e in added {
         println!("+ [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
-    for e in &diff.removed {
+    for e in removed {
         println!("- [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
-    for m in &diff.modified {
+    for m in modified {
         let (before, after) = (&m.before, &m.after);
         println!(
             "~ [{}] {}",
@@ -201,6 +251,21 @@ fn run(cli: Cli) -> engine_api::Result<()> {
             VolumeCommands::Rebuild { volume_id } => {
                 let corrected = rebuild_projection(&conn, volume_id)?;
                 println!("Rebuilt volume {volume_id}: {corrected} entries corrected");
+            }
+            VolumeCommands::Diff {
+                from_volume_id,
+                to_volume_id,
+            } => {
+                let diff = diff_volumes(&conn, from_volume_id, to_volume_id)?;
+                print_changes(&diff.added, &diff.removed, &diff.modified);
+            }
+            VolumeCommands::Merge {
+                source_volume_id,
+                target_volume_id,
+                dry_run,
+            } => {
+                let report = merge_volumes(&conn, source_volume_id, target_volume_id, dry_run)?;
+                print_merge(&report);
             }
         },
         Commands::Entry { command } => match command {

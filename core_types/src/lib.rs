@@ -429,3 +429,56 @@ pub struct RollbackReport {
     pub to_seq: SeqNumber,
     pub events_appended: usize,
 }
+
+/// The difference between the live entries of two volumes. Entries are matched across volumes
+/// by origin, so an entry and its copy in a branch count as the same entry.
+#[derive(Debug, Clone, Default)]
+pub struct VolumeDiff {
+    pub from_volume_id: VolumeId,
+    pub to_volume_id: VolumeId,
+    /// Entries only in `to`.
+    pub added: Vec<Entry>,
+    /// Entries only in `from`.
+    pub removed: Vec<Entry>,
+    /// `before` is the entry in `from`, `after` the entry in `to`.
+    pub modified: Vec<EntryModification>,
+}
+
+impl VolumeDiff {
+    /// True when both volumes have the same live entries.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.modified.is_empty()
+    }
+}
+
+/// An entry that both sides of a merge changed differently since their common base.
+/// Merge leaves it untouched in the target. None means absent or deleted on that side.
+#[derive(Debug, Clone)]
+pub struct MergeConflict {
+    pub base: Option<Entry>,
+    pub source: Option<Entry>,
+    pub target: Option<Entry>,
+}
+
+/// Outcome of merging one volume into another.
+/// Merge never rewrites history: it appends events to the target, and a real merge that changed
+/// anything or found conflicts records a "merged into <target>" snapshot on the source.
+#[derive(Debug, Clone)]
+pub struct MergeReport {
+    pub source_volume_id: VolumeId,
+    pub target_volume_id: VolumeId,
+    /// The common state both sides were compared against.
+    pub base_volume_id: VolumeId,
+    pub base_seq: SeqNumber,
+    /// When true nothing was written; the report shows what a real merge would do.
+    pub dry_run: bool,
+    /// Source entries added (or restored) in the target.
+    pub added: Vec<Entry>,
+    /// Target entries deleted because the source deleted them.
+    pub removed: Vec<Entry>,
+    /// `before` is the target's entry, `after` the source's.
+    pub modified: Vec<EntryModification>,
+    pub conflicts: Vec<MergeConflict>,
+    /// Events appended to the target (or that would be, in a dry run).
+    pub events_appended: usize,
+}
