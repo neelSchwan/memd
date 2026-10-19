@@ -426,7 +426,7 @@ pub struct SearchMemoryRequest {
     )]
     pub volume_id: i64,
     #[schemars(
-        description = "Search phrase for relevant stored memory. Prefer specific keywords, names, decisions, or constraints."
+        description = "Keywords to search for. Entries matching any keyword (or a word starting with it) are returned, best matches first. Prefer specific names, decisions, or constraints."
     )]
     pub query: String,
 }

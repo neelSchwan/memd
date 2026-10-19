@@ -733,19 +733,35 @@ pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>
     rows.into_iter().map(EntryRow::into_entry).collect()
 }
 
-/// Returns all live entries in the volume whose content contains the query string
-/// (case-insensitive for ASCII; `%` and `_` are matched literally)
+/// Turns free text into an FTS5 query that matches entries containing any of its words,
+/// including words that start with them ("auth" matches "authentication").
+/// Each word is quoted, so FTS5 operators in the input are matched as plain text, and FTS5's
+/// own tokenizer decides what counts as a word. Returns None when the text has no words.
+fn fts_query(text: &str) -> Option<String> {
+    let terms: Vec<String> = text
+        .split_whitespace()
+        .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
+/// Full-text search over a volume's live entries, best matches first.
+/// Matching is case-insensitive and word-based; see `fts_query`.
 pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<Vec<Entry>> {
     get_volume(conn, volume_id)?;
+    let Some(match_expr) = fts_query(&query) else {
+        return Ok(Vec::new());
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT {ENTRY_COLS} FROM entries
-            WHERE volume_id = ?1
-            AND deleted = 0
-            AND instr(lower(content), lower(?2)) > 0
-            ORDER BY id ASC"
+            JOIN (SELECT rowid AS match_id, bm25(entries_fts) AS rank
+                  FROM entries_fts WHERE entries_fts MATCH ?2)
+            ON id = match_id
+            WHERE volume_id = ?1 AND deleted = 0
+            ORDER BY rank, id"
     ))?;
     let rows = stmt
-        .query_map((volume_id, query), EntryRow::from_row)?
+        .query_map((volume_id, match_expr), EntryRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter().map(EntryRow::into_entry).collect()
 }

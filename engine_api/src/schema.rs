@@ -1,9 +1,9 @@
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::error::{EngineError, Result};
 
 /// Bump this and add a step to `migrate` whenever the schema changes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
     CREATE TABLE volumes (
@@ -81,6 +81,20 @@ const MIGRATE_V0_TO_V1: &str = "
     CREATE INDEX idx_snapshots_volume ON snapshots(volume_id);
 ";
 
+/// Full-text index over entry content, kept in sync with the entries projection by triggers.
+/// The index has its own copy of the content; rowid is the entry id.
+const MIGRATE_V1_TO_V2: &str = "
+    CREATE VIRTUAL TABLE entries_fts USING fts5(content);
+    INSERT INTO entries_fts (rowid, content) SELECT id, content FROM entries;
+
+    CREATE TRIGGER entries_fts_insert AFTER INSERT ON entries BEGIN
+        INSERT INTO entries_fts (rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER entries_fts_update AFTER UPDATE OF content ON entries BEGIN
+        UPDATE entries_fts SET content = new.content WHERE rowid = new.id;
+    END;
+";
+
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -90,24 +104,34 @@ fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
 /// Brings the database up to `SCHEMA_VERSION`, creating it if empty.
 /// Refuses databases written by a newer version of memd rather than guessing at their schema.
 pub fn migrate(conn: &Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == SCHEMA_VERSION {
+    // Common case: already current, so no write lock is needed.
+    if schema_version(conn)? == SCHEMA_VERSION {
         return Ok(());
     }
+
+    // Take the write lock, then read the version again: another process starting at the same
+    // time may have migrated the database while this one was waiting.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let version = schema_version(&tx)?;
     if version > SCHEMA_VERSION {
         return Err(EngineError::UnsupportedSchemaVersion(version));
     }
-
-    let tx = conn.unchecked_transaction()?;
     if version < 1 {
         if table_exists(&tx, "events")? {
             tx.execute_batch(MIGRATE_V0_TO_V1)?;
         } else {
             tx.execute_batch(SCHEMA_V1)?;
         }
+    }
+    if version < 2 {
+        tx.execute_batch(MIGRATE_V1_TO_V2)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

@@ -91,28 +91,100 @@ fn mutating_deleted_or_missing_entries_fails() {
 }
 
 #[test]
-fn search_is_case_insensitive_and_literal() {
+fn search_matches_words_and_ranks_best_first() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
     add_entry(
         &conn,
         vol.id(),
-        "Coverage is 50% now".into(),
+        "Use Postgres in production".into(),
         EntrySource::User,
     )
     .unwrap();
     add_entry(
         &conn,
         vol.id(),
-        "coverage is 500 lines".into(),
+        "Postgres pool size is 20; postgres runs on port 5432".into(),
+        EntrySource::User,
+    )
+    .unwrap();
+    let auth = add_entry(
+        &conn,
+        vol.id(),
+        "Authentication bug is in middleware.rs".into(),
         EntrySource::User,
     )
     .unwrap();
 
-    assert_eq!(search(&conn, vol.id(), "COVERAGE".into()).unwrap().len(), 2);
+    // Case-insensitive, and the entry that mentions the word most ranks first.
+    let found = search(&conn, vol.id(), "POSTGRES".into()).unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(found[0].content().starts_with("Postgres pool"));
+
+    // Words match by prefix, in any order.
     assert_eq!(
-        contents(&search(&conn, vol.id(), "50%".into()).unwrap()),
-        ["Coverage is 50% now"]
+        contents(&search(&conn, vol.id(), "middleware auth".into()).unwrap()),
+        [auth.content()]
+    );
+
+    // FTS5 syntax in the query is treated as plain text, not as operators.
+    assert_eq!(
+        search(&conn, vol.id(), "auth* AND \"NEAR(".into())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(search(&conn, vol.id(), "%%".into()).unwrap().is_empty());
+}
+
+#[test]
+fn search_follows_updates_deletes_and_volumes() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let other = create_volume(&conn, "other".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    add_entry(
+        &conn,
+        other.id(),
+        "uses sqlite too".into(),
+        EntrySource::User,
+    )
+    .unwrap();
+
+    assert_eq!(search(&conn, vol.id(), "sqlite".into()).unwrap().len(), 1);
+
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    assert!(search(&conn, vol.id(), "sqlite".into()).unwrap().is_empty());
+    assert_eq!(search(&conn, vol.id(), "postgres".into()).unwrap().len(), 1);
+
+    delete_entry(&conn, entry.id()).unwrap();
+    assert!(
+        search(&conn, vol.id(), "postgres".into())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn search_follows_clones_and_rollbacks() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    let snap = snapshot(&conn, vol.id(), "s".into()).unwrap();
+
+    let branch = clone_volume(&conn, snap.id(), None).unwrap();
+    assert_eq!(
+        search(&conn, branch.id(), "sqlite".into()).unwrap().len(),
+        1
+    );
+
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    rollback_to_snapshot(&conn, snap.id()).unwrap();
+    assert_eq!(search(&conn, vol.id(), "sqlite".into()).unwrap().len(), 1);
+    assert!(
+        search(&conn, vol.id(), "postgres".into())
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -339,6 +411,7 @@ fn migrates_v0_database() {
     assert_eq!(rebuild_projection(&conn, 1).unwrap(), 0);
 
     // New features work on migrated data.
+    assert_eq!(search(&conn, 1, "fact".into()).unwrap().len(), 1);
     update_entry(&conn, 1, "new fact".into()).unwrap();
     rollback_to_snapshot(&conn, 1).unwrap();
     assert_eq!(contents(&list_entries(&conn, 1).unwrap()), ["old fact"]);
@@ -395,7 +468,75 @@ fn concurrent_writers_on_one_file_all_succeed() {
         .collect();
     assert_eq!(seqs, (1..=100).collect::<Vec<_>>());
 
+    remove_database_files(&path);
+}
+
+/// Path of a fresh v1 database file (the schema before the full-text index) holding one volume
+/// whose only entry was updated from "uses sqlite" to "uses postgres".
+fn v1_database_file(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("memd-{name}-{}.db", std::process::id()));
+    remove_database_files(&path);
+    let conn = open_db(&path).unwrap();
+    let vol = create_volume(&conn, "legacy".into()).unwrap();
+    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER entries_fts_insert;
+         DROP TRIGGER entries_fts_update;
+         DROP TABLE entries_fts;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    path
+}
+
+fn remove_database_files(path: &std::path::Path) {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[test]
+fn migrates_v1_database_and_indexes_current_content() {
+    let path = v1_database_file("v1-upgrade");
+    let conn = open_db(&path).unwrap();
+
+    assert_eq!(
+        contents(&search(&conn, 1, "postgres".into()).unwrap()),
+        ["uses postgres"]
+    );
+    assert!(search(&conn, 1, "sqlite".into()).unwrap().is_empty());
+
+    drop(conn);
+    remove_database_files(&path);
+}
+
+#[test]
+fn processes_starting_together_migrate_once() {
+    let path = v1_database_file("v1-race");
+
+    // Hold the write lock so every opener reads version 1 and then queues behind it.
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let openers: Vec<_> = (0..3)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || open_db(&path).map(drop))
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    blocker.execute_batch("COMMIT").unwrap();
+
+    for opener in openers {
+        opener.join().unwrap().unwrap();
+    }
+    assert_eq!(
+        search(&open_db(&path).unwrap(), 1, "postgres".into())
+            .unwrap()
+            .len(),
+        1
+    );
+
+    drop(blocker);
+    remove_database_files(&path);
 }
