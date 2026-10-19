@@ -3,7 +3,7 @@ use core_types::{Entry, EntrySource, Event, MemoryDiff};
 use engine_api::{
     add_entry, clone_volume, create_volume, delete_entry, diff_snapshots, entries_at_snapshot,
     entry_history, list_entries, list_events, list_snapshots, list_volumes, open_db,
-    rebuild_projection, rollback_to_snapshot, search, snapshot, update_entry,
+    rebuild_projection, rollback_to_snapshot, search, snapshot, tag_entry, update_entry,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,19 +71,36 @@ enum EntryCommands {
         content: String,
         #[arg(long, default_value = "user")]
         source: EntrySource,
+        /// Tag the entry (repeat for several tags)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
 
     /// Replace the content of an entry
     Update { entry_id: i64, content: String },
 
+    /// Replace all tags of an entry (no tags removes them all)
+    Tag { entry_id: i64, tags: Vec<String> },
+
     /// Delete an entry (it stays in history)
     Delete { entry_id: i64 },
 
     /// List all entries in a volume
-    List { volume_id: i64 },
+    List {
+        volume_id: i64,
+        /// Only entries with this tag (repeat to require several)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
 
     /// Search entries in a volume by content
-    Search { volume_id: i64, query: String },
+    Search {
+        volume_id: i64,
+        query: String,
+        /// Only entries with this tag (repeat to require several)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
 
     /// Show every change made to an entry
     History { volume_id: i64, entry_id: i64 },
@@ -110,15 +127,24 @@ enum SnapshotCommands {
     Rollback { snapshot_id: i64 },
 }
 
+/// Formats content followed by its tags, e.g. `use postgres #db #prod`.
+fn with_tags(content: &str, tags: &[String]) -> String {
+    tags.iter()
+        .fold(content.to_string(), |text, tag| format!("{text} #{tag}"))
+}
+
 fn print_entries(entries: &[Entry]) {
     for e in entries {
-        println!("[{}] {}", e.id(), e.content());
+        println!("[{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
 }
 
 fn print_events(events: &[Event]) {
     for ev in events {
-        let content = ev.content().map(|c| format!(" {c}")).unwrap_or_default();
+        let content = ev
+            .content()
+            .map(|c| format!(" {}", with_tags(c, ev.tags())))
+            .unwrap_or_default();
         println!(
             "#{} {} {} entry={}{}",
             ev.seq(),
@@ -136,14 +162,19 @@ fn print_diff(diff: &MemoryDiff) {
         println!("(no changes)");
     }
     for e in &diff.added {
-        println!("+ [{}] {}", e.id(), e.content());
+        println!("+ [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
     for e in &diff.removed {
-        println!("- [{}] {}", e.id(), e.content());
+        println!("- [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
     for m in &diff.modified {
-        println!("~ [{}] {}", m.before.id(), m.before.content());
-        println!("  -> {}", m.after.content());
+        let (before, after) = (&m.before, &m.after);
+        println!(
+            "~ [{}] {}",
+            before.id(),
+            with_tags(before.content(), before.tags())
+        );
+        println!("  -> {}", with_tags(after.content(), after.tags()));
     }
 }
 
@@ -177,22 +208,31 @@ fn run(cli: Cli) -> engine_api::Result<()> {
                 volume_id,
                 content,
                 source,
+                tags,
             } => {
-                let entry = add_entry(&conn, volume_id, content, source)?;
+                let entry = add_entry(&conn, volume_id, content, source, tags)?;
                 println!("Added entry (id: {})", entry.id());
             }
             EntryCommands::Update { entry_id, content } => {
                 let entry = update_entry(&conn, entry_id, content)?;
                 println!("Updated entry (id: {})", entry.id());
             }
+            EntryCommands::Tag { entry_id, tags } => {
+                let entry = tag_entry(&conn, entry_id, tags)?;
+                println!("Tagged entry (id: {})", entry.id());
+            }
             EntryCommands::Delete { entry_id } => {
                 let entry = delete_entry(&conn, entry_id)?;
                 println!("Deleted entry (id: {})", entry.id());
             }
-            EntryCommands::List { volume_id } => print_entries(&list_entries(&conn, volume_id)?),
-            EntryCommands::Search { volume_id, query } => {
-                print_entries(&search(&conn, volume_id, query)?)
+            EntryCommands::List { volume_id, tags } => {
+                print_entries(&list_entries(&conn, volume_id, &tags)?)
             }
+            EntryCommands::Search {
+                volume_id,
+                query,
+                tags,
+            } => print_entries(&search(&conn, volume_id, query, &tags)?),
             EntryCommands::History {
                 volume_id,
                 entry_id,

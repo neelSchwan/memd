@@ -32,6 +32,8 @@ Every change to a volume is appended to its event log as one of `put_entry`, `up
 - **Rollback** never rewrites history. It appends compensating events that bring the live state back to the snapshot, so a rollback shows up in the log and can itself be undone.
 - **Branching** copies the log up to the snapshot into a new volume, which keeps the full lineage and then evolves independently. The new volume records which snapshot it came from.
 - Deleted entries disappear from listing and search but stay in history.
+- Entries can carry **tags** (lowercase, no spaces or commas). Tags are versioned exactly like
+  content, so rollback, diff and branching cover them too. Listing and search can filter by tags.
 - Search uses SQLite's built-in FTS5 index. It matches whole words and word prefixes in any
   order, and ranks the best matches first.
 
@@ -45,11 +47,12 @@ The database schema is versioned with `PRAGMA user_version`, and databases creat
 | ---------------------- | --------------------------------------------------------------- |
 | `create_volume`        | Create a new memory namespace                                   |
 | `list_volumes`         | List all volumes                                                |
-| `remember`             | Add a text entry to a volume                                    |
+| `remember`             | Add a text entry to a volume, optionally with tags              |
+| `tag_memory`           | Replace an entry's tags (old tags stay in history)              |
 | `update_memory`        | Replace an entry's content (old content stays in history)       |
 | `forget`               | Delete an entry (it stays in history)                           |
-| `list_memory`          | List all live entries in a volume                               |
-| `search_memory`        | Full-text search over entries, best matches first               |
+| `list_memory`          | List live entries in a volume, optionally filtered by tags      |
+| `search_memory`        | Full-text search over entries, best matches first, tag filter   |
 | `memory_history`       | Show the event log for a volume or a single entry               |
 | `create_snapshot`      | Bookmark the current state of a volume                          |
 | `list_snapshots`       | List all snapshots for a volume                                 |
@@ -135,12 +138,13 @@ The `memd` binary exposes the same engine for scripting and inspection:
 cargo build -p engine_api            # builds target/debug/memd
 
 memd volume create notes
-memd entry add 1 "use sqlite in prod" --source agent
+memd entry add 1 "use sqlite in prod" --source agent --tag db
 memd snapshot create 1 before-migration
 memd entry update 1 "use postgres in prod"
 memd snapshot diff 1                 # snapshot 1 vs current state
 memd snapshot rollback 1             # back to "use sqlite in prod"
 memd volume log 1                    # full event history, including the rollback
+memd entry list 1 --tag db           # only entries tagged "db"
 memd clone 1 --name what-if          # branch from snapshot 1
 ```
 
@@ -176,6 +180,6 @@ cargo clippy --all-targets
 - [x] CLI (`memd`) — for scripting and git hooks
 - [ ] Web UI (`memd-ui`) — dashboard for browsing volumes, entries, and snapshot history
 - [x] Full-text search via SQLite FTS5
-- [ ] Entry tagging and filtering
+- [x] Entry tagging and filtering
 - [x] `diff_snapshots`, `delete_entry`, `update_entry`, rollback
 - [ ] Cross-branch diff and merge between a volume and its branches

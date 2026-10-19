@@ -11,7 +11,7 @@ mod schema;
 use chrono::{DateTime, Utc};
 use core_types::{
     DomainError, Entry, EntryId, EntryModification, EntrySource, Event, EventType, MemoryDiff,
-    RollbackReport, SeqNumber, Snapshot, SnapshotId, Volume, VolumeId,
+    RollbackReport, SeqNumber, Snapshot, SnapshotId, Volume, VolumeId, normalize_tags,
 };
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap};
@@ -56,12 +56,33 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-const ENTRY_COLS: &str = "id, volume_id, content, created_at, updated_at, source, deleted";
+/// Tags are stored as one comma-separated string. Commas can't appear in a tag.
+fn join_tags(tags: &[String]) -> String {
+    tags.join(",")
+}
+
+fn split_tags(stored: &str) -> Vec<String> {
+    if stored.is_empty() {
+        Vec::new()
+    } else {
+        stored.split(',').map(String::from).collect()
+    }
+}
+
+/// The part of an entry that put, update and restore events carry. `tags` is in stored form.
+#[derive(Clone, Copy)]
+struct EntryData<'a> {
+    content: &'a str,
+    tags: &'a str,
+}
+
+const ENTRY_COLS: &str = "id, volume_id, content, tags, created_at, updated_at, source, deleted";
 
 struct EntryRow {
     id: EntryId,
     volume_id: VolumeId,
     content: String,
+    tags: String,
     created_at: String,
     updated_at: String,
     source: String,
@@ -74,10 +95,11 @@ impl EntryRow {
             id: row.get(0)?,
             volume_id: row.get(1)?,
             content: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-            source: row.get(5)?,
-            deleted: row.get(6)?,
+            tags: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            source: row.get(6)?,
+            deleted: row.get(7)?,
         })
     }
 
@@ -92,6 +114,7 @@ impl EntryRow {
             self.id,
             self.volume_id,
             self.content,
+            split_tags(&self.tags),
             created_at,
             updated_at,
             self.source.parse()?,
@@ -99,7 +122,7 @@ impl EntryRow {
     }
 }
 
-const EVENT_COLS: &str = "seq, volume_id, event_type, entry_id, content, source, created_at";
+const EVENT_COLS: &str = "seq, volume_id, event_type, entry_id, content, tags, source, created_at";
 
 struct EventRow {
     seq: SeqNumber,
@@ -107,6 +130,7 @@ struct EventRow {
     event_type: String,
     entry_id: EntryId,
     content: Option<String>,
+    tags: String,
     source: Option<String>,
     created_at: String,
 }
@@ -119,8 +143,9 @@ impl EventRow {
             event_type: row.get(2)?,
             entry_id: row.get(3)?,
             content: row.get(4)?,
-            source: row.get(5)?,
-            created_at: row.get(6)?,
+            tags: row.get(5)?,
+            source: row.get(6)?,
+            created_at: row.get(7)?,
         })
     }
 
@@ -132,6 +157,7 @@ impl EventRow {
             self.event_type.parse()?,
             self.entry_id,
             self.content,
+            split_tags(&self.tags),
             source,
             parse_datetime(&self.created_at)?,
         )?)
@@ -227,14 +253,14 @@ fn load_entry_row(conn: &Connection, entry_id: EntryId) -> Result<EntryRow> {
 fn insert_entry_row(
     conn: &Connection,
     volume_id: VolumeId,
-    content: &str,
+    data: EntryData,
     source: EntrySource,
     at: &str,
 ) -> Result<EntryId> {
     conn.execute(
-        "INSERT INTO entries (volume_id, content, created_at, updated_at, source)
-            VALUES (?1, ?2, ?3, ?3, ?4)",
-        (volume_id, content, at, source.as_str()),
+        "INSERT INTO entries (volume_id, content, tags, created_at, updated_at, source)
+            VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        (volume_id, data.content, data.tags, at, source.as_str()),
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -268,24 +294,26 @@ fn volume_name_taken(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 /// Appends one event to a volume's log and returns its sequence number.
+/// `data` is None only for delete events.
 fn append_event(
     conn: &Connection,
     volume_id: VolumeId,
     event_type: EventType,
     entry_id: EntryId,
-    content: Option<&str>,
+    data: Option<EntryData>,
     source: Option<EntrySource>,
     at: &str,
 ) -> Result<SeqNumber> {
     let seq = head_seq(conn, volume_id)? + 1;
     conn.execute(
-        &format!("INSERT INTO events ({EVENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+        &format!("INSERT INTO events ({EVENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
         (
             seq,
             volume_id,
             event_type.as_str(),
             entry_id,
-            content,
+            data.map(|d| d.content),
+            data.map_or("", |d| d.tags),
             source.map(|s| s.as_str()),
             at,
         ),
@@ -299,15 +327,21 @@ fn project_event(
     conn: &Connection,
     event_type: EventType,
     entry_id: EntryId,
-    content: Option<&str>,
+    data: Option<EntryData>,
     at: &str,
 ) -> Result<()> {
     match event_type {
         EventType::PutEntry => {}
         EventType::UpdateEntry | EventType::RestoreEntry => {
             conn.execute(
-                "UPDATE entries SET content = ?1, updated_at = ?2, deleted = 0 WHERE id = ?3",
-                (content, at, entry_id),
+                "UPDATE entries SET content = ?1, tags = ?2, updated_at = ?3, deleted = 0
+                    WHERE id = ?4",
+                (
+                    data.map(|d| d.content),
+                    data.map_or("", |d| d.tags),
+                    at,
+                    entry_id,
+                ),
             )?;
         }
         EventType::DeleteEntry => {
@@ -364,6 +398,8 @@ fn create_volume_inner(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplayedEntry {
     content: String,
+    /// Stored form, see `join_tags`.
+    tags: String,
     source: EntrySource,
     created_at: String,
     updated_at: String,
@@ -386,6 +422,7 @@ fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
             ))
         };
         let content = || ev.content().unwrap_or_default().to_string();
+        let tags = || join_tags(ev.tags());
 
         match ev.event_type() {
             EventType::PutEntry => {
@@ -396,6 +433,7 @@ fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
                     ev.entry_id(),
                     ReplayedEntry {
                         content: content(),
+                        tags: tags(),
                         source: ev.source().unwrap_or(EntrySource::User),
                         created_at: at.clone(),
                         updated_at: at,
@@ -411,6 +449,7 @@ fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
                     return Err(bad("which is deleted"));
                 }
                 entry.content = content();
+                entry.tags = tags();
                 entry.updated_at = at;
             }
             EventType::DeleteEntry => {
@@ -431,6 +470,7 @@ fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
                     return Err(bad("which is not deleted"));
                 }
                 entry.content = content();
+                entry.tags = tags();
                 entry.deleted = false;
                 entry.updated_at = at;
             }
@@ -452,6 +492,7 @@ fn live_entries(
                 id,
                 volume_id,
                 e.content,
+                split_tags(&e.tags),
                 parse_datetime(&e.created_at)?,
                 parse_datetime(&e.updated_at)?,
                 e.source,
@@ -489,6 +530,7 @@ fn rebuild_projection_inner(conn: &Connection, volume_id: VolumeId) -> Result<us
         match replayed.get(&row.id) {
             Some(replayed) => {
                 let in_sync = row.content == replayed.content
+                    && row.tags == replayed.tags
                     && row.source == replayed.source.as_str()
                     && row.created_at == replayed.created_at
                     && row.updated_at == replayed.updated_at
@@ -496,10 +538,12 @@ fn rebuild_projection_inner(conn: &Connection, volume_id: VolumeId) -> Result<us
                 if !in_sync {
                     conn.execute(
                         "UPDATE entries
-                            SET content = ?1, source = ?2, created_at = ?3, updated_at = ?4, deleted = ?5
-                            WHERE id = ?6",
+                            SET content = ?1, tags = ?2, source = ?3, created_at = ?4,
+                                updated_at = ?5, deleted = ?6
+                            WHERE id = ?7",
                         (
                             &replayed.content,
+                            &replayed.tags,
                             replayed.source.as_str(),
                             &replayed.created_at,
                             &replayed.updated_at,
@@ -578,15 +622,18 @@ pub fn clone_volume(
     let mut new_entry_ids: HashMap<EntryId, EntryId> = HashMap::new();
     for ev in &events {
         let at = ev.created_at().to_rfc3339();
+        let tags = join_tags(ev.tags());
+        let data = ev.content().map(|content| EntryData {
+            content,
+            tags: &tags,
+        });
         if ev.event_type() == EventType::PutEntry {
             let source = ev.source().unwrap_or(EntrySource::User);
-            let new_id = insert_entry_row(
-                &tx,
-                new_volume.id(),
-                ev.content().unwrap_or_default(),
-                source,
-                &at,
-            )?;
+            let row = EntryData {
+                content: ev.content().unwrap_or_default(),
+                tags: &tags,
+            };
+            let new_id = insert_entry_row(&tx, new_volume.id(), row, source, &at)?;
             new_entry_ids.insert(ev.entry_id(), new_id);
         }
         let entry_id = *new_entry_ids.get(&ev.entry_id()).ok_or_else(|| {
@@ -602,7 +649,7 @@ pub fn clone_volume(
             new_volume.id(),
             ev.event_type(),
             entry_id,
-            ev.content(),
+            data,
             ev.source(),
             &at,
         )?;
@@ -633,28 +680,37 @@ pub fn add_entry(
     volume_id: VolumeId,
     content: String,
     source: EntrySource,
+    tags: Vec<String>,
 ) -> Result<Entry> {
     if content.trim().is_empty() {
         return Err(DomainError::EmptyEntryContent.into());
     }
+    let tags = normalize_tags(tags)?;
     let tx = write_tx(conn)?;
     get_volume(&tx, volume_id)?;
 
     let now = Utc::now();
     let at = now.to_rfc3339();
-    let entry_id = insert_entry_row(&tx, volume_id, &content, source, &at)?;
+    let stored_tags = join_tags(&tags);
+    let data = EntryData {
+        content: &content,
+        tags: &stored_tags,
+    };
+    let entry_id = insert_entry_row(&tx, volume_id, data, source, &at)?;
     append_event(
         &tx,
         volume_id,
         EventType::PutEntry,
         entry_id,
-        Some(&content),
+        Some(data),
         Some(source),
         &at,
     )?;
     tx.commit()?;
 
-    Ok(Entry::new(entry_id, volume_id, content, now, now, source)?)
+    Ok(Entry::new(
+        entry_id, volume_id, content, tags, now, now, source,
+    )?)
 }
 
 /// Returns a live entry by id
@@ -666,29 +722,51 @@ pub fn get_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
     row.into_entry()
 }
 
-/// Replaces the content of an entry, recording an UpdateEntry event.
+/// Replaces the content of an entry, keeping its tags, and records an UpdateEntry event.
 /// Writing identical content is a no-op and records nothing.
 pub fn update_entry(conn: &Connection, entry_id: EntryId, content: String) -> Result<Entry> {
     if content.trim().is_empty() {
         return Err(DomainError::EmptyEntryContent.into());
     }
+    change_entry(conn, entry_id, Some(content), None)
+}
+
+/// Replaces all tags of an entry, keeping its content, and records an UpdateEntry event.
+/// Pass an empty list to remove every tag. Setting the same tags again records nothing.
+pub fn tag_entry(conn: &Connection, entry_id: EntryId, tags: Vec<String>) -> Result<Entry> {
+    change_entry(conn, entry_id, None, Some(normalize_tags(tags)?))
+}
+
+/// Shared by `update_entry` and `tag_entry`: whatever is None keeps its current value.
+fn change_entry(
+    conn: &Connection,
+    entry_id: EntryId,
+    new_content: Option<String>,
+    new_tags: Option<Vec<String>>,
+) -> Result<Entry> {
     let tx = write_tx(conn)?;
     let row = load_entry_row(&tx, entry_id)?;
     if row.deleted {
         return Err(EngineError::EntryDeleted(entry_id));
     }
-    if row.content != content {
+    let content = new_content.unwrap_or_else(|| row.content.clone());
+    let tags = new_tags.map_or_else(|| row.tags.clone(), |tags| join_tags(&tags));
+    if content != row.content || tags != row.tags {
         let at = now();
+        let data = EntryData {
+            content: &content,
+            tags: &tags,
+        };
         append_event(
             &tx,
             row.volume_id,
             EventType::UpdateEntry,
             entry_id,
-            Some(&content),
+            Some(data),
             None,
             &at,
         )?;
-        project_event(&tx, EventType::UpdateEntry, entry_id, Some(&content), &at)?;
+        project_event(&tx, EventType::UpdateEntry, entry_id, Some(data), &at)?;
     }
     let entry = load_entry_row(&tx, entry_id)?.into_entry()?;
     tx.commit()?;
@@ -721,8 +799,18 @@ pub fn delete_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
     Ok(entry)
 }
 
-/// Returns all live entries for a given volume, ordered by insertion
-pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>> {
+/// Keeps only the entries that carry every one of `tags`. An empty list keeps everything.
+fn filter_by_tags(rows: Vec<EntryRow>, tags: &[String]) -> Result<Vec<Entry>> {
+    let tags = normalize_tags(tags.to_vec())?;
+    rows.into_iter()
+        .map(EntryRow::into_entry)
+        .filter(|entry| entry.as_ref().map_or(true, |entry| entry.has_tags(&tags)))
+        .collect()
+}
+
+/// Returns the live entries of a volume that carry all of `tags` (all entries when `tags` is
+/// empty), ordered by insertion
+pub fn list_entries(conn: &Connection, volume_id: VolumeId, tags: &[String]) -> Result<Vec<Entry>> {
     get_volume(conn, volume_id)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {ENTRY_COLS} FROM entries WHERE volume_id = ?1 AND deleted = 0 ORDER BY id ASC"
@@ -730,7 +818,7 @@ pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>
     let rows = stmt
         .query_map([volume_id], EntryRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(EntryRow::into_entry).collect()
+    filter_by_tags(rows, tags)
 }
 
 /// Turns free text into an FTS5 query that matches entries containing any of its words,
@@ -745,9 +833,14 @@ fn fts_query(text: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" OR "))
 }
 
-/// Full-text search over a volume's live entries, best matches first.
-/// Matching is case-insensitive and word-based; see `fts_query`.
-pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<Vec<Entry>> {
+/// Full-text search over a volume's live entries, best matches first, keeping only entries
+/// that carry all of `tags`. Matching is case-insensitive and word-based; see `fts_query`.
+pub fn search(
+    conn: &Connection,
+    volume_id: VolumeId,
+    query: String,
+    tags: &[String],
+) -> Result<Vec<Entry>> {
     get_volume(conn, volume_id)?;
     let Some(match_expr) = fts_query(&query) else {
         return Ok(Vec::new());
@@ -763,7 +856,7 @@ pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<V
     let rows = stmt
         .query_map((volume_id, match_expr), EntryRow::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(EntryRow::into_entry).collect()
+    filter_by_tags(rows, tags)
 }
 
 // ---------------------------------------------------------------------------
@@ -872,7 +965,7 @@ pub fn diff(
     for (id, old) in before {
         match after.remove(&id) {
             None => result.removed.push(old),
-            Some(new) if new.content() != old.content() => {
+            Some(new) if new.content() != old.content() || new.tags() != old.tags() => {
                 result.modified.push(EntryModification {
                     before: old,
                     after: new,
@@ -927,18 +1020,24 @@ pub fn rollback_to_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Resul
     let at = now();
     let mut events_appended = 0;
     for (id, cur) in &current {
-        let change = match target.get(id) {
-            Some(want) if cur.deleted => Some((EventType::RestoreEntry, Some(want.content()))),
-            Some(want) if cur.content != want.content() => {
-                Some((EventType::UpdateEntry, Some(want.content())))
+        let wanted = target
+            .get(id)
+            .map(|want| (want.content(), join_tags(want.tags())));
+        let event_type = match &wanted {
+            Some(_) if cur.deleted => Some(EventType::RestoreEntry),
+            Some((content, tags)) if cur.content != *content || cur.tags != *tags => {
+                Some(EventType::UpdateEntry)
             }
             Some(_) => None,
-            None if !cur.deleted => Some((EventType::DeleteEntry, None)),
+            None if !cur.deleted => Some(EventType::DeleteEntry),
             None => None,
         };
-        if let Some((event_type, content)) = change {
-            append_event(&tx, volume_id, event_type, *id, content, None, &at)?;
-            project_event(&tx, event_type, *id, content, &at)?;
+        if let Some(event_type) = event_type {
+            let data = wanted
+                .as_ref()
+                .map(|(content, tags)| EntryData { content, tags });
+            append_event(&tx, volume_id, event_type, *id, data, None, &at)?;
+            project_event(&tx, event_type, *id, data, &at)?;
             events_appended += 1;
         }
     }

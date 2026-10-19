@@ -10,7 +10,7 @@ finish a meaningful piece of work.
   `restore_entry`. Each event stores its own content, so the log alone can rebuild any state.
 - `entries` is a projection. Rows are never physically deleted (events reference them through a
   foreign key); deletion sets `deleted = 1`.
-- Schema version is 2 (`PRAGMA user_version`). Databases from before versioning ("v0") are
+- Schema version is 3 (`PRAGMA user_version`). Databases from before versioning ("v0") are
   migrated automatically.
 - Tests: `engine_api/tests/engine.rs`. The MCP server has no automated tests; it was checked by
   hand over stdio (see below).
@@ -57,6 +57,13 @@ covers it.
 **Newer databases are refused.** `migrate` returns `UnsupportedSchemaVersion` when the database
 is newer than the build, instead of quietly marking it with an older version.
 
+**Tags travel with content.** Put, update and restore events carry the entry's full tag list,
+stored as one comma-separated string (tags can't contain commas). Treating tags as part of the
+entry's state, rather than as separate tag/untag events, means replay, rollback, diff and clone
+handle them with no tag-specific code. Tag filtering happens in Rust after loading entries:
+volumes are small, and it avoids a join table. `Event::new` takes one argument per column, so it
+allows clippy's `too_many_arguments`.
+
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.
 
@@ -74,10 +81,13 @@ printf '%s\n' \
 
 ## Ideas for next steps
 
+- **One representation for tags.** Inside the engine, tags are sometimes a `Vec<String>` and
+  sometimes the stored comma-joined string (`EntryData`, `ReplayedEntry`). Keeping `Vec<String>`
+  everywhere and joining/splitting only at the SQL boundary would remove the "stored form" notes.
+
 - **Cross-branch diff and merge.** Clones get new entry ids, so comparing a branch with its parent
   needs a way to track which entry a cloned entry came from (for example an `origin_entry_id`
   column set during cloning).
-- **Entry tags** and filtering.
 - **MCP tests** that start the server in-process and call tools.
 
 ## History
@@ -102,3 +112,8 @@ printf '%s\n' \
 - `search` now uses an FTS5 index (schema v2) with prefix matching and `bm25` ranking.
 - Review found that two processes upgrading the same database at once could fail; `migrate` now
   takes the write lock first and re-reads the version.
+
+### 2026-10-19: Entry tags
+
+- Schema v3 adds `tags` to `entries` and `events`. New `tag_entry`; `add_entry`, `list_entries` and
+  `search` take tags. MCP: `tag_memory`, plus `tags` on `remember`, `list_memory`, `search_memory`.
