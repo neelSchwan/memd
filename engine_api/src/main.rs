@@ -127,19 +127,24 @@ enum SnapshotCommands {
     Rollback { snapshot_id: i64 },
 }
 
+/// Formats content followed by its tags, e.g. `use postgres #db #prod`.
+fn with_tags(content: &str, tags: &[String]) -> String {
+    tags.iter()
+        .fold(content.to_string(), |text, tag| format!("{text} #{tag}"))
+}
+
 fn print_entries(entries: &[Entry]) {
     for e in entries {
-        if e.tags().is_empty() {
-            println!("[{}] {}", e.id(), e.content());
-        } else {
-            println!("[{}] {} #{}", e.id(), e.content(), e.tags().join(" #"));
-        }
+        println!("[{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
 }
 
 fn print_events(events: &[Event]) {
     for ev in events {
-        let content = ev.content().map(|c| format!(" {c}")).unwrap_or_default();
+        let content = ev
+            .content()
+            .map(|c| format!(" {}", with_tags(c, ev.tags())))
+            .unwrap_or_default();
         println!(
             "#{} {} {} entry={}{}",
             ev.seq(),
@@ -157,14 +162,19 @@ fn print_diff(diff: &MemoryDiff) {
         println!("(no changes)");
     }
     for e in &diff.added {
-        println!("+ [{}] {}", e.id(), e.content());
+        println!("+ [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
     for e in &diff.removed {
-        println!("- [{}] {}", e.id(), e.content());
+        println!("- [{}] {}", e.id(), with_tags(e.content(), e.tags()));
     }
     for m in &diff.modified {
-        println!("~ [{}] {}", m.before.id(), m.before.content());
-        println!("  -> {}", m.after.content());
+        let (before, after) = (&m.before, &m.after);
+        println!(
+            "~ [{}] {}",
+            before.id(),
+            with_tags(before.content(), before.tags())
+        );
+        println!("  -> {}", with_tags(after.content(), after.tags()));
     }
 }
 

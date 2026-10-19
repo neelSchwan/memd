@@ -81,6 +81,10 @@ printf '%s\n' \
 
 ## Ideas for next steps
 
+- **One representation for tags.** Inside the engine, tags are sometimes a `Vec<String>` and
+  sometimes the stored comma-joined string (`EntryData`, `ReplayedEntry`). Keeping `Vec<String>`
+  everywhere and joining/splitting only at the SQL boundary would remove the "stored form" notes.
+
 - **Cross-branch diff and merge.** Clones get new entry ids, so comparing a branch with its parent
   needs a way to track which entry a cloned entry came from (for example an `origin_entry_id`
   column set during cloning).

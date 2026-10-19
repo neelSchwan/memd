@@ -627,8 +627,13 @@ pub fn clone_volume(
             content,
             tags: &tags,
         });
-        if let (EventType::PutEntry, Some(data)) = (ev.event_type(), data) {
+        if ev.event_type() == EventType::PutEntry {
             let source = ev.source().unwrap_or(EntrySource::User);
+            // Put events always carry content, so `data` is Some here.
+            let data = data.unwrap_or(EntryData {
+                content: "",
+                tags: "",
+            });
             let new_id = insert_entry_row(&tx, new_volume.id(), data, source, &at)?;
             new_entry_ids.insert(ev.entry_id(), new_id);
         }
@@ -798,14 +803,10 @@ pub fn delete_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
 /// Keeps only the entries that carry every one of `tags`. An empty list keeps everything.
 fn filter_by_tags(rows: Vec<EntryRow>, tags: &[String]) -> Result<Vec<Entry>> {
     let tags = normalize_tags(tags.to_vec())?;
-    let entries = rows
-        .into_iter()
+    rows.into_iter()
         .map(EntryRow::into_entry)
-        .collect::<Result<Vec<_>>>()?;
-    Ok(entries
-        .into_iter()
-        .filter(|entry| entry.has_tags(&tags))
-        .collect())
+        .filter(|entry| entry.as_ref().map_or(true, |entry| entry.has_tags(&tags)))
+        .collect()
 }
 
 /// Returns the live entries of a volume that carry all of `tags` (all entries when `tags` is

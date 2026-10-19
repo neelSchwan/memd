@@ -364,6 +364,25 @@ fn tag_entry_is_versioned_like_content() {
 }
 
 #[test]
+fn restoring_a_deleted_entry_brings_back_its_tags() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "x".into(),
+        EntrySource::User,
+        tags(&["db"]),
+    )
+    .unwrap();
+    let before = snapshot(&conn, vol.id(), "before".into()).unwrap();
+    delete_entry(&conn, entry.id()).unwrap();
+
+    rollback_to_snapshot(&conn, before.id()).unwrap();
+    assert_eq!(get_entry(&conn, entry.id()).unwrap().tags(), ["db"]);
+}
+
+#[test]
 fn rebuild_projection_repairs_tags() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();

@@ -88,7 +88,7 @@ impl MemdServer {
     /// List all memory entries in a volume
     #[tool(
         name = "list_memory",
-        description = "Return all stored memory entries in a volume in insertion order. Use this when you need full inspection or auditing of the memory state. Do not use this when you only need relevant entries; use search_memory for targeted retrieval."
+        description = "Return the stored memory entries in a volume in insertion order, optionally only those carrying all of the given tags. Use this when you need full inspection or auditing of the memory state. Do not use this when you only need relevant entries; use search_memory for targeted retrieval."
     )]
     pub async fn list_memory(
         &self,
@@ -108,7 +108,7 @@ impl MemdServer {
     /// Search memory entries in a volume by content substring
     #[tool(
         name = "search_memory",
-        description = "Retrieve memory entries relevant to a search phrase within one volume. Use this before answering when prior stored context may affect the response. Do not use this for web search, current events, or facts never written to this memory system."
+        description = "Retrieve memory entries relevant to a search phrase within one volume. Use this before answering when prior stored context may affect the response. The search looks at entry content only; to narrow by tag, pass the tags parameter. Do not use this for web search, current events, or facts never written to this memory system."
     )]
     pub async fn search_memory(
         &self,
