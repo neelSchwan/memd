@@ -2,8 +2,8 @@ use rusqlite::{Connection, Transaction};
 
 use crate::error::{EngineError, Result};
 
-/// Bump this and add a step to `migrate` whenever the schema changes.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Bump this and add a step to `MIGRATIONS` whenever the schema changes.
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
     CREATE TABLE volumes (
@@ -81,6 +81,23 @@ const MIGRATE_V0_TO_V1: &str = "
     CREATE INDEX idx_snapshots_volume ON snapshots(volume_id);
 ";
 
+/// Full-text index over entry content, kept in sync with the entries projection by triggers.
+/// The index has its own copy of the content; rowid is the entry id.
+const MIGRATE_V1_TO_V2: &str = "
+    CREATE VIRTUAL TABLE entries_fts USING fts5(content);
+    INSERT INTO entries_fts (rowid, content) SELECT id, content FROM entries;
+
+    CREATE TRIGGER entries_fts_insert AFTER INSERT ON entries BEGIN
+        INSERT INTO entries_fts (rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER entries_fts_update AFTER UPDATE OF content ON entries BEGIN
+        UPDATE entries_fts SET content = new.content WHERE rowid = new.id;
+    END;
+";
+
+/// Steps after v1, applied in order. Each brings the schema up to the version it is paired with.
+const MIGRATIONS: &[(i64, &str)] = &[(2, MIGRATE_V1_TO_V2)];
+
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -107,6 +124,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             tx.execute_batch(MIGRATE_V0_TO_V1)?;
         } else {
             tx.execute_batch(SCHEMA_V1)?;
+        }
+    }
+    for (target, sql) in MIGRATIONS {
+        if version < *target {
+            tx.execute_batch(sql)?;
         }
     }
 
