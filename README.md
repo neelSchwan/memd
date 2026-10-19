@@ -4,7 +4,7 @@ A persistent, versioned memory store exposed as an MCP server. Lets AI agents (C
 
 ## What it does
 
-Memory is organized into **volumes** (isolated namespaces). Each volume holds **entries** (text snippets) and an append-only event log. You can **snapshot** a volume at any point in time and **clone** it from a snapshot, giving you Git-like branching for memory.
+Memory is organized into **volumes** (isolated namespaces). Each volume holds **entries** (text snippets) and an append-only event log. You can **snapshot** a volume at any point in time, **diff** snapshots, **roll back** to one, or **branch** a new volume from one, giving you Git-like version control for memory.
 
 ```
 Volume "work-notes"
@@ -23,20 +23,38 @@ memd/
 └── memd-mcp/      MCP server — exposes engine_api as tools over stdio
 ```
 
+### Event sourcing
+
+Every change to a volume is appended to its event log as one of `put_entry`, `update_entry`, `delete_entry` or `restore_entry`. Each event carries its own payload, so the log alone fully describes a volume's history:
+
+- The `entries` table is a **projection** of the log. `memd volume rebuild` replays the log and repairs any rows that drifted.
+- A **snapshot** is just a pointer to a sequence number. Viewing or diffing a snapshot replays the log up to that point.
+- **Rollback** never rewrites history. It appends compensating events that bring the live state back to the snapshot, so a rollback shows up in the log and can itself be undone.
+- **Branching** copies the log up to the snapshot into a new volume, which keeps the full lineage and then evolves independently. The new volume records which snapshot it came from.
+- Deleted entries disappear from listing and search but stay in history.
+
+The database schema is versioned with `PRAGMA user_version`, and databases created by earlier versions of memd are migrated automatically on startup.
+
 `engine_api` is the stable core. `memd-mcp` is one frontend — additional frontends (HTTP API, CLI, UI) can be added without touching the storage layer.
 
 ## Tools
 
-| Tool              | Description                            |
-| ----------------- | -------------------------------------- |
-| `create_volume`   | Create a new memory namespace          |
-| `list_volumes`    | List all volumes                       |
-| `add_entry`       | Add a text entry to a volume           |
-| `list_entries`    | List all entries in a volume           |
-| `search_entries`  | Search entries by content substring    |
-| `create_snapshot` | Bookmark the current state of a volume |
-| `list_snapshots`  | List all snapshots for a volume        |
-| `clone_volume`    | Create a new volume from a snapshot    |
+| Tool                   | Description                                                     |
+| ---------------------- | --------------------------------------------------------------- |
+| `create_volume`        | Create a new memory namespace                                   |
+| `list_volumes`         | List all volumes                                                |
+| `remember`             | Add a text entry to a volume                                    |
+| `update_memory`        | Replace an entry's content (old content stays in history)       |
+| `forget`               | Delete an entry (it stays in history)                           |
+| `list_memory`          | List all live entries in a volume                               |
+| `search_memory`        | Search entries by content substring (case-insensitive)          |
+| `memory_history`       | Show the event log for a volume or a single entry               |
+| `create_snapshot`      | Bookmark the current state of a volume                          |
+| `list_snapshots`       | List all snapshots for a volume                                 |
+| `memory_at_snapshot`   | Show the entries a volume had at a snapshot                     |
+| `diff_snapshots`       | Compare two snapshots, or a snapshot with the current state     |
+| `rollback_to_snapshot` | Return a volume to a snapshot's state without rewriting history |
+| `branch_from_snapshot` | Create a new volume from a snapshot                             |
 
 ## Getting started
 
@@ -107,15 +125,55 @@ Create or edit the Cursor MCP config file for your platform:
 
 Restart Cursor. The tools will be available to the AI in every conversation.
 
+## CLI
+
+The `memd` binary exposes the same engine for scripting and inspection:
+
+```bash
+cargo build -p engine_api            # builds target/debug/memd
+
+memd volume create notes
+memd entry add 1 "use sqlite in prod" --source agent
+memd snapshot create 1 before-migration
+memd entry update 1 "use postgres in prod"
+memd snapshot diff 1                 # snapshot 1 vs current state
+memd snapshot rollback 1             # back to "use sqlite in prod"
+memd volume log 1                    # full event history, including the rollback
+memd clone 1 --name what-if          # branch from snapshot 1
+```
+
+Run `memd --help` for every command.
+
 ## Data
 
-The SQLite database is created as `memd.db` in the working directory the server is launched from. All data persists across restarts.
+By default the SQLite database is `memd.db` in the working directory the server is launched from. Set `MEMD_DB` to use a fixed path instead, which is recommended for MCP clients since they may launch the server from an arbitrary directory:
+
+```json
+{
+  "mcpServers": {
+    "memd": {
+      "command": "/path/to/memd/target/debug/memd-mcp",
+      "env": { "MEMD_DB": "/path/to/memd.db" }
+    }
+  }
+}
+```
+
+The CLI reads `MEMD_DB` too, or takes `--db <path>`. All data persists across restarts.
+
+## Development
+
+```bash
+cargo test
+cargo clippy --all-targets
+```
 
 ## Roadmap
 
 - [ ] HTTP API (`memd-server`) — so any service can call memd, not just MCP clients
-- [ ] CLI (`memd-cli`) — for scripting and git hooks
+- [x] CLI (`memd`) — for scripting and git hooks
 - [ ] Web UI (`memd-ui`) — dashboard for browsing volumes, entries, and snapshot history
 - [ ] Full-text search via SQLite FTS5
 - [ ] Entry tagging and filtering
-- [ ] `diff_snapshots`, `delete_entry`, `update_entry`
+- [x] `diff_snapshots`, `delete_entry`, `update_entry`, rollback
+- [ ] Cross-branch diff and merge between a volume and its branches

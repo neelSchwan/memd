@@ -1,0 +1,116 @@
+use rusqlite::{Connection, Transaction};
+
+use crate::error::{EngineError, Result};
+
+/// Bump this and add a step to `migrate` whenever the schema changes.
+pub const SCHEMA_VERSION: i64 = 1;
+
+const SCHEMA_V1: &str = "
+    CREATE TABLE volumes (
+        id                 INTEGER PRIMARY KEY,
+        name               TEXT NOT NULL UNIQUE,
+        created_at         TEXT NOT NULL,
+        parent_snapshot_id INTEGER REFERENCES snapshots(id)
+    );
+
+    -- Projection of the event log: the current state of every entry.
+    -- Rows are never physically removed so events can always reference them.
+    CREATE TABLE entries (
+        id         INTEGER PRIMARY KEY,
+        volume_id  INTEGER NOT NULL REFERENCES volumes(id),
+        content    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        source     TEXT NOT NULL CHECK (source IN ('user', 'agent', 'tool')),
+        updated_at TEXT NOT NULL DEFAULT '',
+        deleted    INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE events (
+        seq        INTEGER NOT NULL,
+        volume_id  INTEGER NOT NULL REFERENCES volumes(id),
+        event_type TEXT NOT NULL
+                   CHECK (event_type IN ('put_entry', 'update_entry', 'delete_entry', 'restore_entry')),
+        entry_id   INTEGER NOT NULL REFERENCES entries(id),
+        content    TEXT,
+        source     TEXT CHECK (source IS NULL OR source IN ('user', 'agent', 'tool')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (volume_id, seq)
+    );
+
+    CREATE TABLE snapshots (
+        id                 INTEGER PRIMARY KEY,
+        volume_id          INTEGER NOT NULL REFERENCES volumes(id),
+        event_seq_pointer  INTEGER NOT NULL,
+        created_at         TEXT NOT NULL,
+        label              TEXT NOT NULL
+    );
+
+    CREATE INDEX idx_entries_volume ON entries(volume_id);
+    CREATE INDEX idx_events_entry ON events(entry_id);
+    CREATE INDEX idx_snapshots_volume ON snapshots(volume_id);
+";
+
+/// v0 shipped without a user_version: events only had put_entry and no payload.
+/// Entries are never mutated in v0, so their content is each put event's payload.
+const MIGRATE_V0_TO_V1: &str = "
+    ALTER TABLE volumes ADD COLUMN parent_snapshot_id INTEGER REFERENCES snapshots(id);
+
+    ALTER TABLE entries ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+    ALTER TABLE entries ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+    UPDATE entries SET updated_at = created_at;
+
+    CREATE TABLE events_v1 (
+        seq        INTEGER NOT NULL,
+        volume_id  INTEGER NOT NULL REFERENCES volumes(id),
+        event_type TEXT NOT NULL
+                   CHECK (event_type IN ('put_entry', 'update_entry', 'delete_entry', 'restore_entry')),
+        entry_id   INTEGER NOT NULL REFERENCES entries(id),
+        content    TEXT,
+        source     TEXT CHECK (source IS NULL OR source IN ('user', 'agent', 'tool')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (volume_id, seq)
+    );
+    INSERT INTO events_v1 (seq, volume_id, event_type, entry_id, content, source, created_at)
+        SELECT ev.seq, ev.volume_id, ev.event_type, ev.entry_id, en.content, en.source, ev.created_at
+        FROM events ev JOIN entries en ON en.id = ev.entry_id;
+    DROP TABLE events;
+    ALTER TABLE events_v1 RENAME TO events;
+
+    CREATE INDEX idx_entries_volume ON entries(volume_id);
+    CREATE INDEX idx_events_entry ON events(entry_id);
+    CREATE INDEX idx_snapshots_volume ON snapshots(volume_id);
+";
+
+fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Brings the database up to `SCHEMA_VERSION`, creating it if empty.
+/// Refuses databases written by a newer version of memd rather than guessing at their schema.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version > SCHEMA_VERSION {
+        return Err(EngineError::UnsupportedSchemaVersion(version));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    if version < 1 {
+        if table_exists(&tx, "events")? {
+            tx.execute_batch(MIGRATE_V0_TO_V1)?;
+        } else {
+            tx.execute_batch(SCHEMA_V1)?;
+        }
+    }
+
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+    tx.commit()?;
+    Ok(())
+}
