@@ -20,7 +20,8 @@ Volume "work-notes"
 memd/
 ├── core_types/    Domain types: Volume, Entry, Snapshot, Event
 ├── engine_api/    SQLite-backed storage logic
-└── memd-mcp/      MCP server — exposes engine_api as tools over stdio
+├── memd-mcp/      MCP server — exposes engine_api as tools over stdio
+└── memd-server/   HTTP API — exposes engine_api as JSON over HTTP
 ```
 
 ### Event sourcing
@@ -43,7 +44,7 @@ Every change to a volume is appended to its event log as one of `put_entry`, `up
 
 The database schema is versioned with `PRAGMA user_version`, and databases created by earlier versions of memd are migrated automatically on startup.
 
-`engine_api` is the stable core. `memd-mcp` is one frontend — additional frontends (HTTP API, CLI, UI) can be added without touching the storage layer.
+`engine_api` is the stable core. `memd-mcp`, `memd-server` and the `memd` CLI are thin frontends over it; more can be added without touching the storage layer.
 
 ## Tools
 
@@ -139,6 +140,30 @@ Create or edit the Cursor MCP config file for your platform:
 
 Restart Cursor. The tools will be available to the AI in every conversation.
 
+## HTTP API
+
+`memd-server` serves the same engine as JSON over HTTP, so any service can use memd, not just MCP
+clients:
+
+```bash
+cargo build -p memd-server
+MEMD_DB=/path/to/memd.db target/debug/memd-server     # listens on 127.0.0.1:7878
+
+json='Content-Type: application/json'
+curl -X POST -H "$json" localhost:7878/api/volumes -d '{"name": "work"}'
+curl -X POST -H "$json" localhost:7878/api/volumes/1/entries -d '{"content": "use postgres", "tags": ["db"]}'
+curl "localhost:7878/api/volumes/1/search?q=postgres"
+```
+
+The server has no authentication and only serves local use:
+- It answers only requests addressed to `localhost`, `127.0.0.1` or `[::1]`, which blocks DNS
+  rebinding.
+- Requests that change data must be sent as `application/json`. Web pages on other sites can't
+  send that to it, so pages open in your browser can't plant or change memories.
+
+`MEMD_ADDR` changes the listen port. All routes are listed at the top of
+[`memd-server/src/lib.rs`](memd-server/src/lib.rs).
+
 ## CLI
 
 The `memd` binary exposes the same engine for scripting and inspection:
@@ -188,7 +213,7 @@ cargo clippy --all-targets
 
 ## Roadmap
 
-- [ ] HTTP API (`memd-server`) — so any service can call memd, not just MCP clients
+- [x] HTTP API (`memd-server`) — so any service can call memd, not just MCP clients
 - [x] CLI (`memd`) — for scripting and git hooks
 - [ ] Web UI (`memd-ui`) — dashboard for browsing volumes, entries, and snapshot history
 - [x] Full-text search via SQLite FTS5

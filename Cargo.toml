@@ -1,3 +1,3 @@
 [workspace]
-members = ["core_types", "engine_api", "memd-mcp"]
+members = ["core_types", "engine_api", "memd-mcp", "memd-server"]
 resolver = "3"

@@ -770,25 +770,30 @@ pub fn get_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
 /// Replaces the content of an entry, keeping its tags, and records an UpdateEntry event.
 /// Writing identical content is a no-op and records nothing.
 pub fn update_entry(conn: &Connection, entry_id: EntryId, content: String) -> Result<Entry> {
-    if content.trim().is_empty() {
-        return Err(DomainError::EmptyEntryContent.into());
-    }
-    change_entry(conn, entry_id, Some(content), None)
+    edit_entry(conn, entry_id, Some(content), None)
 }
 
 /// Replaces all tags of an entry, keeping its content, and records an UpdateEntry event.
 /// Pass an empty list to remove every tag. Setting the same tags again records nothing.
 pub fn tag_entry(conn: &Connection, entry_id: EntryId, tags: Vec<String>) -> Result<Entry> {
-    change_entry(conn, entry_id, None, Some(normalize_tags(tags)?))
+    edit_entry(conn, entry_id, None, Some(tags))
 }
 
-/// Shared by `update_entry` and `tag_entry`: whatever is None keeps its current value.
-fn change_entry(
+/// Changes an entry's content, tags, or both in one UpdateEntry event. Whatever is None keeps
+/// its current value; if nothing actually changes, no event is recorded.
+pub fn edit_entry(
     conn: &Connection,
     entry_id: EntryId,
     new_content: Option<String>,
     new_tags: Option<Vec<String>>,
 ) -> Result<Entry> {
+    if new_content
+        .as_ref()
+        .is_some_and(|content| content.trim().is_empty())
+    {
+        return Err(DomainError::EmptyEntryContent.into());
+    }
+    let new_tags = new_tags.map(normalize_tags).transpose()?;
     let tx = write_tx(conn)?;
     let row = load_entry_row(&tx, entry_id)?;
     if row.deleted {
