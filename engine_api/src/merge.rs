@@ -14,8 +14,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::{
     EngineError, EntryData, Result, append_event, compare_states, entry_data, entry_origins,
-    get_snapshot, get_volume, head_seq, insert_entry_row, join_tags, load_events, now,
-    project_event, state_map_at, write_tx,
+    get_snapshot, get_volume, head_seq, insert_entry_row, load_events, now, project_event,
+    state_map_at, write_tx,
 };
 
 /// Live entries of a volume as of `seq`, keyed by origin.
@@ -131,10 +131,9 @@ enum Write<'a> {
 fn write_change(conn: &Connection, target: VolumeId, write: &Write, at: &str) -> Result<()> {
     match *write {
         Write::New { origin, entry } => {
-            let tags = join_tags(entry.tags());
             let data = EntryData {
                 content: entry.content(),
-                tags: &tags,
+                tags: entry.tags(),
             };
             let entry_id = insert_entry_row(conn, target, data, entry.source(), at, Some(origin))?;
             let source = Some(entry.source());
@@ -153,10 +152,9 @@ fn write_change(conn: &Connection, target: VolumeId, write: &Write, at: &str) ->
             entry_id,
             entry,
         } => {
-            let tags = entry.map(|entry| join_tags(entry.tags()));
-            let data = entry.zip(tags.as_deref()).map(|(entry, tags)| EntryData {
+            let data = entry.map(|entry| EntryData {
                 content: entry.content(),
-                tags,
+                tags: entry.tags(),
             });
             append_event(conn, target, event_type, entry_id, data, None, at)?;
             project_event(conn, event_type, entry_id, data, at)?;

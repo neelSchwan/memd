@@ -58,7 +58,8 @@ covers it.
 is newer than the build, instead of quietly marking it with an older version.
 
 **Tags travel with content.** Put, update and restore events carry the entry's full tag list,
-stored as one comma-separated string (tags can't contain commas). Treating tags as part of the
+stored as one comma-separated string (tags can't contain commas). Inside the engine tags are
+always a `Vec<String>`; `join_tags`/`split_tags` convert only where rows are written and read. Treating tags as part of the
 entry's state, rather than as separate tag/untag events, means replay, rollback, diff and clone
 handle them with no tag-specific code. Tag filtering happens in Rust after loading entries:
 volumes are small, and it avoids a join table. `Event::new` takes one argument per column, so it
@@ -136,9 +137,7 @@ printf '%s\n' \
 
 ## Ideas for next steps
 
-- **One representation for tags.** Inside the engine, tags are sometimes a `Vec<String>` and
-  sometimes the stored comma-joined string (`EntryData`, `ReplayedEntry`). Keeping `Vec<String>`
-  everywhere and joining/splitting only at the SQL boundary would remove the "stored form" notes.
+None open. The README roadmap is complete; add new ideas here.
 
 ## History
 
@@ -194,3 +193,8 @@ printf '%s\n' \
 
 - `GET /` on `memd-server` serves `memd-server/ui/index.html`, covering entries, history,
   snapshots, and compare and merge.
+
+### 2026-10-19: One tag representation
+
+- The engine no longer passes the stored comma-joined tag string around (`EntryData`,
+  `ReplayedEntry`, rollback, merge). Rows convert to and from `Vec<String>` at the SQL boundary.
