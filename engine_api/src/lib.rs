@@ -629,12 +629,11 @@ pub fn clone_volume(
         });
         if ev.event_type() == EventType::PutEntry {
             let source = ev.source().unwrap_or(EntrySource::User);
-            // Put events always carry content, so `data` is Some here.
-            let data = data.unwrap_or(EntryData {
-                content: "",
-                tags: "",
-            });
-            let new_id = insert_entry_row(&tx, new_volume.id(), data, source, &at)?;
+            let row = EntryData {
+                content: ev.content().unwrap_or_default(),
+                tags: &tags,
+            };
+            let new_id = insert_entry_row(&tx, new_volume.id(), row, source, &at)?;
             new_entry_ids.insert(ev.entry_id(), new_id);
         }
         let entry_id = *new_entry_ids.get(&ev.entry_id()).ok_or_else(|| {
