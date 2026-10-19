@@ -1,4 +1,7 @@
-use core_types::{Entry, EntrySource, Event, EventType, MemoryDiff, Snapshot, Volume};
+use core_types::{
+    Entry, EntryModification, EntrySource, Event, EventType, MemoryDiff, MergeReport, Snapshot,
+    Volume,
+};
 use engine_api::Connection;
 use rmcp::{
     Json, ServiceExt,
@@ -296,6 +299,55 @@ impl MemdServer {
         Ok(Json(DiffResponse::from(&diff)))
     }
 
+    /// Compare the current entries of two volumes
+    #[tool(
+        name = "diff_volumes",
+        description = "Compare the current memories of two volumes, for example a branch and the volume it was branched from. Entries are matched across branches, so an edited entry shows as modified rather than as removed and added. Swap the IDs to see the other direction."
+    )]
+    pub async fn diff_volumes(
+        &self,
+        params: Parameters<DiffVolumesRequest>,
+    ) -> Result<Json<VolumeDiffResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let diff = engine_api::diff_volumes(&conn, request.from_volume_id, request.to_volume_id)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Json(VolumeDiffResponse {
+            added: diff.added.iter().map(EntryResponse::from).collect(),
+            removed: diff.removed.iter().map(EntryResponse::from).collect(),
+            modified: diff
+                .modified
+                .iter()
+                .map(ModifiedEntryResponse::from)
+                .collect(),
+        }))
+    }
+
+    /// Merge one volume's changes into a related volume
+    #[tool(
+        name = "merge_volumes",
+        description = "Apply the memory changes made on one volume (usually a branch) to a related volume, such as the volume it was branched from. History is preserved: changes are recorded as new events on the target. Entries changed differently on both sides are left alone and returned as conflicts; to take the source's version, update the target's entry with update_memory. Run with dry_run first to preview."
+    )]
+    pub async fn merge_volumes(
+        &self,
+        params: Parameters<MergeVolumesRequest>,
+    ) -> Result<Json<MergeResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let report = engine_api::merge_volumes(
+            &conn,
+            request.source_volume_id,
+            request.target_volume_id,
+            request.dry_run,
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(Json(MergeResponse::from(&report)))
+    }
+
     /// Roll a volume back to a snapshot
     #[tool(
         name = "rollback_to_snapshot",
@@ -380,13 +432,39 @@ impl From<&MemoryDiff> for DiffResponse {
             to_seq: d.to_seq,
             added: d.added.iter().map(EntryResponse::from).collect(),
             removed: d.removed.iter().map(EntryResponse::from).collect(),
-            modified: d
-                .modified
+            modified: d.modified.iter().map(ModifiedEntryResponse::from).collect(),
+        }
+    }
+}
+
+impl From<&EntryModification> for ModifiedEntryResponse {
+    fn from(m: &EntryModification) -> Self {
+        ModifiedEntryResponse {
+            entry_id: m.before.id(),
+            before: EntryResponse::from(&m.before),
+            after: EntryResponse::from(&m.after),
+        }
+    }
+}
+
+impl From<&MergeReport> for MergeResponse {
+    fn from(r: &MergeReport) -> Self {
+        let entry = |e: &Option<Entry>| e.as_ref().map(EntryResponse::from);
+        MergeResponse {
+            dry_run: r.dry_run,
+            base_volume_id: r.base_volume_id,
+            base_seq: r.base_seq,
+            events_appended: r.events_appended,
+            added: r.added.iter().map(EntryResponse::from).collect(),
+            removed: r.removed.iter().map(EntryResponse::from).collect(),
+            modified: r.modified.iter().map(ModifiedEntryResponse::from).collect(),
+            conflicts: r
+                .conflicts
                 .iter()
-                .map(|m| ModifiedEntryResponse {
-                    entry_id: m.after.id(),
-                    before: m.before.content().to_string(),
-                    after: m.after.content().to_string(),
+                .map(|c| ConflictResponse {
+                    base: entry(&c.base),
+                    source: entry(&c.source),
+                    target: entry(&c.target),
                 })
                 .collect(),
         }
@@ -602,8 +680,62 @@ pub struct EventListResponse {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ModifiedEntryResponse {
     pub entry_id: i64,
-    pub before: String,
-    pub after: String,
+    pub before: EntryResponse,
+    pub after: EntryResponse,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct DiffVolumesRequest {
+    #[schemars(description = "Volume ID to compare from, e.g. the parent volume.")]
+    pub from_volume_id: i64,
+    #[schemars(description = "Volume ID to compare to, e.g. a branch of it.")]
+    pub to_volume_id: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct VolumeDiffResponse {
+    /// Entries only in the `to` volume.
+    pub added: Vec<EntryResponse>,
+    /// Entries only in the `from` volume.
+    pub removed: Vec<EntryResponse>,
+    pub modified: Vec<ModifiedEntryResponse>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct MergeVolumesRequest {
+    #[schemars(description = "Volume whose changes should be applied, usually a branch.")]
+    pub source_volume_id: i64,
+    #[schemars(description = "Volume to apply the changes to, usually the branch's parent.")]
+    pub target_volume_id: i64,
+    #[serde(default)]
+    #[schemars(description = "When true, only report what would change. Defaults to false.")]
+    pub dry_run: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ConflictResponse {
+    /// The entry as both sides last agreed on it; null if it did not exist then.
+    pub base: Option<EntryResponse>,
+    /// The source's version; null if the source deleted it.
+    pub source: Option<EntryResponse>,
+    /// The target's version, which the merge kept; null if the target deleted it.
+    pub target: Option<EntryResponse>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct MergeResponse {
+    pub dry_run: bool,
+    /// The common state both sides were compared against.
+    pub base_volume_id: i64,
+    pub base_seq: i64,
+    /// Events appended to the target (or that would be, in a dry run).
+    pub events_appended: usize,
+    pub added: Vec<EntryResponse>,
+    pub removed: Vec<EntryResponse>,
+    /// `before` is the target's version, `after` the source's.
+    pub modified: Vec<ModifiedEntryResponse>,
+    /// Entries changed differently on both sides; left as they are in the target.
+    pub conflicts: Vec<ConflictResponse>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

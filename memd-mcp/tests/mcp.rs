@@ -141,12 +141,14 @@ fn lists_all_tools() {
             "create_snapshot",
             "create_volume",
             "diff_snapshots",
+            "diff_volumes",
             "forget",
             "list_memory",
             "list_snapshots",
             "list_volumes",
             "memory_at_snapshot",
             "memory_history",
+            "merge_volumes",
             "remember",
             "rollback_to_snapshot",
             "search_memory",
@@ -319,5 +321,72 @@ fn tool_errors_are_readable() {
             json!({ "volume_id": volume_id, "content": "", "source": "User" })
         ),
         "entry content must not be empty"
+    );
+}
+
+#[test]
+fn branch_merge_back_and_report_conflicts() {
+    let mut server = Server::start("branch_merge_back_and_report_conflicts");
+    let main_id = server.call("create_volume", json!({ "name": "main" }))["id"].clone();
+    let fact = server.call(
+        "remember",
+        json!({ "volume_id": main_id, "content": "Ship on Tuesday", "source": "User" }),
+    );
+    let snapshot = server.call(
+        "create_snapshot",
+        json!({ "volume_id": main_id, "label": "fork" }),
+    );
+    let branch = server.call(
+        "branch_from_snapshot",
+        json!({ "snapshot_id": snapshot["id"], "name": "plan-b" }),
+    );
+    let branch_fact =
+        server.call("list_memory", json!({ "volume_id": branch["id"] }))["entries"][0].clone();
+
+    // Both sides edit the same entry, and the branch adds one of its own.
+    server.call(
+        "update_memory",
+        json!({ "entry_id": fact["id"], "content": "Ship on Wednesday" }),
+    );
+    server.call(
+        "update_memory",
+        json!({ "entry_id": branch_fact["id"], "content": "Ship on Thursday" }),
+    );
+    server.call(
+        "remember",
+        json!({ "volume_id": branch["id"], "content": "Feature flag rollout", "source": "Agent" }),
+    );
+
+    let diff = server.call(
+        "diff_volumes",
+        json!({ "from_volume_id": main_id, "to_volume_id": branch["id"] }),
+    );
+    assert_eq!(contents(&diff["added"]), ["Feature flag rollout"]);
+    assert_eq!(diff["modified"][0]["after"]["content"], "Ship on Thursday");
+
+    let preview = server.call(
+        "merge_volumes",
+        json!({ "source_volume_id": branch["id"], "target_volume_id": main_id, "dry_run": true }),
+    );
+    assert_eq!(preview["dry_run"], true);
+
+    let merged = server.call(
+        "merge_volumes",
+        json!({ "source_volume_id": branch["id"], "target_volume_id": main_id }),
+    );
+    assert_eq!(contents(&merged["added"]), ["Feature flag rollout"]);
+    assert_eq!(
+        merged["conflicts"][0]["source"]["content"],
+        "Ship on Thursday"
+    );
+    assert_eq!(
+        merged["conflicts"][0]["target"]["content"],
+        "Ship on Wednesday"
+    );
+
+    let listed = server.call("list_memory", json!({ "volume_id": main_id }));
+    assert_eq!(
+        contents(&listed["entries"]),
+        ["Ship on Wednesday", "Feature flag rollout"]
     );
 }

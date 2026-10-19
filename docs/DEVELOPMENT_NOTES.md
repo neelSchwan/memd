@@ -10,7 +10,7 @@ finish a meaningful piece of work.
   `restore_entry`. Each event stores its own content, so the log alone can rebuild any state.
 - `entries` is a projection. Rows are never physically deleted (events reference them through a
   foreign key); deletion sets `deleted = 1`.
-- Schema version is 3 (`PRAGMA user_version`). Databases from before versioning ("v0") are
+- Schema version is 4 (`PRAGMA user_version`). Databases from before versioning ("v0") are
   migrated automatically.
 - Tests: `engine_api/tests/engine.rs` for the engine, and `memd-mcp/tests/mcp.rs`, which starts the
   real `memd-mcp` binary on a temporary database and calls tools over stdio JSON-RPC.
@@ -64,6 +64,25 @@ handle them with no tag-specific code. Tag filtering happens in Rust after loadi
 volumes are small, and it avoids a join table. `Event::new` takes one argument per column, so it
 allows clippy's `too_many_arguments`.
 
+**Entries are matched across volumes by origin.** `entries.origin_entry_id` points at the
+original entry a copy was made from; `COALESCE(origin_entry_id, id)` is an entry's origin. Clones
+and merges copy the origin, so a clone of a clone still points at the root entry, and a volume never
+holds two entries with the same origin. Migration v4 links existing clones by pairing each copied
+put event with the source's put at the same seq.
+
+**Merge is three-way and appends ordinary events.** The base is the most recent merge between the
+two volumes (recorded as a snapshot on the source with `merged_into_volume_id`), or else the fork
+point found by walking both volumes' `parent_snapshot_id` chains. Without the merge bookmark,
+merging a long-lived branch twice would turn every re-edited entry into a false conflict. Merge
+writes put/update/delete/restore events, so there is no new event type and rollback undoes a
+merge like any other change. It lives in `engine_api/src/merge.rs`.
+
+**Conflicts are reported and skipped.** Agents often merge without reading the preview, and "theirs
+wins" would silently overwrite the target's edits. After a merge, the base moves past a skipped
+conflict, so it counts as settled in favor of the target. To take the source's version, update the
+target's entry. Rolling a target back to before a merge also sticks: re-merging won't re-apply the
+source's unchanged entries.
+
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.
 
@@ -84,10 +103,6 @@ printf '%s\n' \
 - **One representation for tags.** Inside the engine, tags are sometimes a `Vec<String>` and
   sometimes the stored comma-joined string (`EntryData`, `ReplayedEntry`). Keeping `Vec<String>`
   everywhere and joining/splitting only at the SQL boundary would remove the "stored form" notes.
-
-- **Cross-branch diff and merge.** Clones get new entry ids, so comparing a branch with its parent
-  needs a way to track which entry a cloned entry came from (for example an `origin_entry_id`
-  column set during cloning).
 
 ## History
 
@@ -124,3 +139,10 @@ printf '%s\n' \
   Covered: the tool list, a remember/update/forget/rollback workflow, branching, tag filtering,
   omitted optional fields and `isError` results. `serde_json` is a dev-dependency only; it was
   already in the dependency tree through `rmcp`.
+
+### 2026-10-19: Cross-branch diff and merge
+
+- Schema v4 adds `entries.origin_entry_id` and `snapshots.merged_into_volume_id`, backfilling
+  origins for existing clones. New `diff_volumes` and `merge_volumes`, MCP tools of the same name,
+  and `memd volume diff/merge`. Designed by a planning agent, then implemented and reviewed.
+- MCP diff responses now return full entries (with tags) for `before`/`after`, not just content.

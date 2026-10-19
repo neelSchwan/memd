@@ -3,7 +3,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::error::{EngineError, Result};
 
 /// Bump this and add a step to `migrate` whenever the schema changes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA_V1: &str = "
     CREATE TABLE volumes (
@@ -101,6 +101,44 @@ const MIGRATE_V2_TO_V3: &str = "
     ALTER TABLE events ADD COLUMN tags TEXT NOT NULL DEFAULT '';
 ";
 
+/// Entry origins, so the same entry can be recognized across a volume and its branches, and the
+/// merge bookmark on snapshots. Both are plain integers: entry rows are never deleted, so a foreign
+/// key would add nothing.
+///
+/// Existing clones are linked up during migration. `clone_volume` copies a snapshot's events into
+/// the new volume in order, so the clone's put at seq N is a copy of the source's put at seq N.
+/// Those pairs are linked, then followed to the root so clones of clones point at the original.
+const MIGRATE_V3_TO_V4: &str = "
+    ALTER TABLE entries ADD COLUMN origin_entry_id INTEGER;
+    ALTER TABLE snapshots ADD COLUMN merged_into_volume_id INTEGER;
+
+    WITH RECURSIVE
+        copied_from(entry_id, source_entry_id) AS (
+            SELECT clone_ev.entry_id, source_ev.entry_id
+            FROM volumes v
+            JOIN snapshots s ON s.id = v.parent_snapshot_id
+            JOIN events clone_ev ON clone_ev.volume_id = v.id
+                AND clone_ev.seq <= s.event_seq_pointer
+            JOIN events source_ev ON source_ev.volume_id = s.volume_id
+                AND source_ev.seq = clone_ev.seq
+            WHERE clone_ev.event_type = 'put_entry'
+                AND source_ev.event_type = 'put_entry'
+                AND clone_ev.content IS source_ev.content
+        ),
+        ancestor(entry_id, ancestor_id) AS (
+            SELECT entry_id, source_entry_id FROM copied_from
+            UNION ALL
+            SELECT a.entry_id, c.source_entry_id
+            FROM ancestor a JOIN copied_from c ON c.entry_id = a.ancestor_id
+        )
+    UPDATE entries SET origin_entry_id = (
+        SELECT ancestor_id FROM ancestor
+        WHERE ancestor.entry_id = entries.id
+            AND ancestor_id NOT IN (SELECT entry_id FROM copied_from)
+    )
+    WHERE id IN (SELECT entry_id FROM copied_from);
+";
+
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -141,6 +179,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if version < 3 {
         tx.execute_batch(MIGRATE_V2_TO_V3)?;
+    }
+    if version < 4 {
+        tx.execute_batch(MIGRATE_V3_TO_V4)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

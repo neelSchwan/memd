@@ -31,6 +31,10 @@ Every change to a volume is appended to its event log as one of `put_entry`, `up
 - A **snapshot** is just a pointer to a sequence number. Viewing or diffing a snapshot replays the log up to that point.
 - **Rollback** never rewrites history. It appends compensating events that bring the live state back to the snapshot, so a rollback shows up in the log and can itself be undone.
 - **Branching** copies the log up to the snapshot into a new volume, which keeps the full lineage and then evolves independently. The new volume records which snapshot it came from.
+- **Merging** brings a branch's changes back into its parent (or any related volume). Every entry
+  is compared three ways: as both sides last agreed on it, on the source, and on the target.
+  Changes made only on the source are applied by appending events. Entries changed differently
+  on both sides are reported as conflicts and left alone. A dry run previews the merge.
 - Deleted entries disappear from listing and search but stay in history.
 - Entries can carry **tags** (lowercase, no spaces or commas). Tags are versioned exactly like
   content, so rollback, diff and branching cover them too. Listing and search can filter by tags.
@@ -60,6 +64,8 @@ The database schema is versioned with `PRAGMA user_version`, and databases creat
 | `diff_snapshots`       | Compare two snapshots, or a snapshot with the current state     |
 | `rollback_to_snapshot` | Return a volume to a snapshot's state without rewriting history |
 | `branch_from_snapshot` | Create a new volume from a snapshot                             |
+| `diff_volumes`         | Compare two volumes, e.g. a branch and its parent               |
+| `merge_volumes`        | Apply a branch's changes to a related volume (with dry run)     |
 
 ## Getting started
 
@@ -145,7 +151,10 @@ memd snapshot diff 1                 # snapshot 1 vs current state
 memd snapshot rollback 1             # back to "use sqlite in prod"
 memd volume log 1                    # full event history, including the rollback
 memd entry list 1 --tag db           # only entries tagged "db"
-memd clone 1 --name what-if          # branch from snapshot 1
+memd clone 1 --name what-if          # branch from snapshot 1 (creates volume 2)
+memd volume diff 1 2                 # compare the branch with its parent
+memd volume merge 2 1 --dry-run      # preview applying the branch's changes
+memd volume merge 2 1                # apply them
 ```
 
 Run `memd --help` for every command.
@@ -182,4 +191,4 @@ cargo clippy --all-targets
 - [x] Full-text search via SQLite FTS5
 - [x] Entry tagging and filtering
 - [x] `diff_snapshots`, `delete_entry`, `update_entry`, rollback
-- [ ] Cross-branch diff and merge between a volume and its branches
+- [x] Cross-branch diff and merge between a volume and its branches
