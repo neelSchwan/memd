@@ -1,5 +1,4 @@
-use core_types::{Entry, EntrySource, Snapshot, Volume};
-use engine_api::init_db;
+use core_types::{Entry, EntrySource, Event, EventType, MemoryDiff, Snapshot, Volume};
 use rmcp::{
     Json, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -23,9 +22,8 @@ impl rmcp::ServerHandler for MemdServer {}
 #[tool_router(router = tool_router)]
 impl MemdServer {
     pub fn new() -> anyhow::Result<Self> {
-        let conn = Connection::open("memd.db")?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        init_db(&conn)?;
+        let path = std::env::var("MEMD_DB").unwrap_or_else(|_| "memd.db".to_string());
+        let conn = engine_api::open_db(path)?;
         Ok(Self {
             tool_router: Self::tool_router(),
             conn: Arc::new(Mutex::new(conn)),
@@ -172,10 +170,131 @@ impl MemdServer {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
 
-        let vol =
-            engine_api::clone_volume(&conn, request.snapshot_id).map_err(|e| e.to_string())?;
+        let vol = engine_api::clone_volume(&conn, request.snapshot_id, request.name)
+            .map_err(|e| e.to_string())?;
 
         Ok(Json(VolumeResponse::from(&vol)))
+    }
+
+    /// Replace the content of a memory entry
+    #[tool(
+        name = "update_memory",
+        description = "Correct or refine a stored memory entry in place. Use this when a fact you stored earlier has changed or was wrong, instead of adding a contradicting entry. The previous content stays in the history and can be restored by rolling back."
+    )]
+    pub async fn update_memory(
+        &self,
+        params: Parameters<UpdateMemoryRequest>,
+    ) -> Result<Json<EntryResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let entry = engine_api::update_entry(&conn, request.entry_id, request.content)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Json(EntryResponse::from(&entry)))
+    }
+
+    /// Delete a memory entry
+    #[tool(
+        name = "forget",
+        description = "Remove a memory entry that is obsolete, wrong, or that the user asked you to forget. The entry disappears from list_memory and search_memory but remains in memory_history, and rolling back to an earlier snapshot brings it back."
+    )]
+    pub async fn forget(
+        &self,
+        params: Parameters<ForgetRequest>,
+    ) -> Result<Json<EntryResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let entry = engine_api::delete_entry(&conn, request.entry_id).map_err(|e| e.to_string())?;
+
+        Ok(Json(EntryResponse::from(&entry)))
+    }
+
+    /// Show the event log for a volume or one entry
+    #[tool(
+        name = "memory_history",
+        description = "Return the append-only change log for a memory volume, or for a single entry when entry_id is given. Use this to audit how memory evolved, find when a fact was added, changed, or forgotten, or pick a point to snapshot or roll back to."
+    )]
+    pub async fn memory_history(
+        &self,
+        params: Parameters<MemoryHistoryRequest>,
+    ) -> Result<Json<EventListResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let events = match request.entry_id {
+            Some(entry_id) => engine_api::entry_history(&conn, entry_id),
+            None => engine_api::list_events(&conn, request.volume_id),
+        }
+        .map_err(|e| e.to_string())?;
+
+        Ok(Json(EventListResponse {
+            events: events.iter().map(EventResponse::from).collect(),
+        }))
+    }
+
+    /// Show the entries a volume had at a snapshot
+    #[tool(
+        name = "memory_at_snapshot",
+        description = "Return the memory entries exactly as they were when a snapshot was taken, without changing anything. Use this to inspect an earlier state before deciding whether to branch from it or roll back to it."
+    )]
+    pub async fn memory_at_snapshot(
+        &self,
+        params: Parameters<SnapshotRequest>,
+    ) -> Result<Json<EntryListResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let entries = engine_api::entries_at_snapshot(&conn, request.snapshot_id)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Json(EntryListResponse {
+            entries: entries.iter().map(EntryResponse::from).collect(),
+        }))
+    }
+
+    /// Compare two snapshots, or a snapshot with the current state
+    #[tool(
+        name = "diff_snapshots",
+        description = "Show which memory entries were added, removed, or modified between two snapshots of the same volume, or between a snapshot and the current state when to_snapshot_id is omitted. Use this to review what changed since a checkpoint."
+    )]
+    pub async fn diff_snapshots(
+        &self,
+        params: Parameters<DiffSnapshotsRequest>,
+    ) -> Result<Json<DiffResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let diff =
+            engine_api::diff_snapshots(&conn, request.from_snapshot_id, request.to_snapshot_id)
+                .map_err(|e| e.to_string())?;
+
+        Ok(Json(DiffResponse::from(&diff)))
+    }
+
+    /// Roll a volume back to a snapshot
+    #[tool(
+        name = "rollback_to_snapshot",
+        description = "Return a memory volume to the exact state it had at a snapshot, undoing later additions, edits, and deletions. History is preserved: the rollback is recorded as new events, so it can itself be undone by rolling back to a later snapshot. Use branch_from_snapshot instead if you want to keep the current state too."
+    )]
+    pub async fn rollback_to_snapshot(
+        &self,
+        params: Parameters<SnapshotRequest>,
+    ) -> Result<Json<RollbackResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let report = engine_api::rollback_to_snapshot(&conn, request.snapshot_id)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Json(RollbackResponse {
+            volume_id: report.volume_id,
+            snapshot_id: report.snapshot_id,
+            from_seq: report.from_seq,
+            to_seq: report.to_seq,
+            events_appended: report.events_appended,
+        }))
     }
 }
 
@@ -185,6 +304,7 @@ impl From<&Volume> for VolumeResponse {
             id: v.id(),
             name: v.name().to_string(),
             created_at: v.created_at().to_rfc3339(),
+            parent_snapshot_id: v.parent_snapshot_id(),
         }
     }
 }
@@ -208,7 +328,42 @@ impl From<&Entry> for EntryResponse {
             volume_id: e.volume_id(),
             content: e.content().to_string(),
             created_at: e.created_at().to_rfc3339(),
+            updated_at: e.updated_at().to_rfc3339(),
             source: e.source(),
+        }
+    }
+}
+
+impl From<&Event> for EventResponse {
+    fn from(ev: &Event) -> Self {
+        EventResponse {
+            seq: ev.seq(),
+            volume_id: ev.volume_id(),
+            event_type: ev.event_type(),
+            entry_id: ev.entry_id(),
+            content: ev.content().map(str::to_string),
+            source: ev.source(),
+            created_at: ev.created_at().to_rfc3339(),
+        }
+    }
+}
+
+impl From<&MemoryDiff> for DiffResponse {
+    fn from(d: &MemoryDiff) -> Self {
+        DiffResponse {
+            from_seq: d.from_seq,
+            to_seq: d.to_seq,
+            added: d.added.iter().map(EntryResponse::from).collect(),
+            removed: d.removed.iter().map(EntryResponse::from).collect(),
+            modified: d
+                .modified
+                .iter()
+                .map(|m| ModifiedEntryResponse {
+                    entry_id: m.after.id(),
+                    before: m.before.content().to_string(),
+                    after: m.after.content().to_string(),
+                })
+                .collect(),
         }
     }
 }
@@ -226,6 +381,8 @@ pub struct VolumeResponse {
     pub id: i64,
     pub name: String,
     pub created_at: String,
+    /// Snapshot this volume was branched from, if any.
+    pub parent_snapshot_id: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -258,6 +415,7 @@ pub struct EntryResponse {
     pub volume_id: i64,
     pub content: String,
     pub created_at: String,
+    pub updated_at: String,
     pub source: EntrySource,
 }
 
@@ -275,9 +433,7 @@ pub struct SearchMemoryRequest {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct CreateSnapshotRequest {
-    #[schemars(
-        description = "Numeric ID of the memory volume to checkpoint."
-    )]
+    #[schemars(description = "Numeric ID of the memory volume to checkpoint.")]
     pub volume_id: i64,
     #[schemars(
         description = "Human-readable checkpoint label describing the milestone or state being captured."
@@ -291,6 +447,10 @@ pub struct BranchFromSnapshotRequest {
         description = "Numeric ID of the snapshot to branch from. Use list_snapshots to discover valid snapshot IDs."
     )]
     pub snapshot_id: i64,
+    #[schemars(
+        description = "Optional name for the new volume. Defaults to the source volume's name with a _clone suffix."
+    )]
+    pub name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -323,6 +483,94 @@ pub struct EntryListResponse {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotListResponse {
     pub snapshots: Vec<SnapshotResponse>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct UpdateMemoryRequest {
+    #[schemars(
+        description = "Numeric ID of the memory entry to update. Use list_memory or search_memory to find it."
+    )]
+    pub entry_id: i64,
+    #[schemars(description = "The full replacement content for the entry.")]
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ForgetRequest {
+    #[schemars(
+        description = "Numeric ID of the memory entry to remove. Use list_memory or search_memory to find it."
+    )]
+    pub entry_id: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct MemoryHistoryRequest {
+    #[schemars(description = "Numeric ID of the memory volume whose change log to return.")]
+    pub volume_id: i64,
+    #[schemars(
+        description = "Optional entry ID. When set, only the changes to that entry are returned."
+    )]
+    pub entry_id: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotRequest {
+    #[schemars(
+        description = "Numeric ID of the snapshot. Use list_snapshots to discover valid snapshot IDs."
+    )]
+    pub snapshot_id: i64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct DiffSnapshotsRequest {
+    #[schemars(description = "Snapshot ID marking the earlier point to compare from.")]
+    pub from_snapshot_id: i64,
+    #[schemars(
+        description = "Snapshot ID to compare to, from the same volume. Omit to compare against the current state."
+    )]
+    pub to_snapshot_id: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct EventResponse {
+    pub seq: i64,
+    pub volume_id: i64,
+    pub event_type: EventType,
+    pub entry_id: i64,
+    /// New content for put, update and restore events.
+    pub content: Option<String>,
+    pub source: Option<EntrySource>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct EventListResponse {
+    pub events: Vec<EventResponse>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ModifiedEntryResponse {
+    pub entry_id: i64,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct DiffResponse {
+    pub from_seq: i64,
+    pub to_seq: i64,
+    pub added: Vec<EntryResponse>,
+    pub removed: Vec<EntryResponse>,
+    pub modified: Vec<ModifiedEntryResponse>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct RollbackResponse {
+    pub volume_id: i64,
+    pub snapshot_id: i64,
+    pub from_seq: i64,
+    pub to_seq: i64,
+    pub events_appended: usize,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

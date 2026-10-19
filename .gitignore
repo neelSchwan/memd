@@ -1,2 +1,4 @@
 /target
 memd.db
+memd.db-wal
+memd.db-shm

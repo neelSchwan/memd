@@ -1,31 +1,587 @@
+//! SQLite-backed, event-sourced memory engine.
+//!
+//! Every change to a volume is appended to the `events` table. The `entries` table is a
+//! projection of that log: it can be thrown away and rebuilt with `rebuild_projection`,
+//! and any past state can be reconstructed with `state_at`. Snapshots are pointers into
+//! the log, so branching, diffing and rollback are all just replays.
+
+mod error;
+mod schema;
+
 use chrono::{DateTime, Utc};
-use core_types::{DomainError, Entry, EntrySource, Snapshot, SnapshotId, Volume, VolumeId};
-use rusqlite::{Connection, Result};
+use core_types::{
+    DomainError, Entry, EntryId, EntryModification, EntrySource, Event, EventType, MemoryDiff,
+    RollbackReport, SeqNumber, Snapshot, SnapshotId, Volume, VolumeId,
+};
+use rusqlite::{Connection, OptionalExtension, Row};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
-fn domain_err(e: DomainError) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+pub use error::{EngineError, Result};
+pub use schema::SCHEMA_VERSION;
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+/// Opens (or creates) the database at `path` and brings its schema up to date.
+pub fn open_db(path: impl AsRef<Path>) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    // WAL lets the CLI read while the MCP server holds the database open.
+    conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    init_db(&conn)?;
+    Ok(conn)
 }
 
-fn parse_datetime(s: String) -> rusqlite::Result<DateTime<Utc>> {
+/// Creates all tables if they don't exist and migrates older databases.
+/// Safe to call on every startup.
+pub fn init_db(conn: &Connection) -> Result<()> {
+    schema::migrate(conn)
+}
+
+// ---------------------------------------------------------------------------
+// Row mapping
+// ---------------------------------------------------------------------------
+
+fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     s.parse::<DateTime<Utc>>()
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        .map_err(|e| EngineError::Corrupt(format!("invalid timestamp '{s}': {e}")))
 }
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+const ENTRY_COLS: &str = "id, volume_id, content, created_at, updated_at, source, deleted";
+
+struct EntryRow {
+    id: EntryId,
+    volume_id: VolumeId,
+    content: String,
+    created_at: String,
+    updated_at: String,
+    source: String,
+    deleted: bool,
+}
+
+impl EntryRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            volume_id: row.get(1)?,
+            content: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+            source: row.get(5)?,
+            deleted: row.get(6)?,
+        })
+    }
+
+    fn into_entry(self) -> Result<Entry> {
+        let created_at = parse_datetime(&self.created_at)?;
+        let updated_at = if self.updated_at.is_empty() {
+            created_at
+        } else {
+            parse_datetime(&self.updated_at)?
+        };
+        Ok(Entry::new(
+            self.id,
+            self.volume_id,
+            self.content,
+            created_at,
+            updated_at,
+            self.source.parse()?,
+        )?)
+    }
+}
+
+const EVENT_COLS: &str = "seq, volume_id, event_type, entry_id, content, source, created_at";
+
+struct EventRow {
+    seq: SeqNumber,
+    volume_id: VolumeId,
+    event_type: String,
+    entry_id: EntryId,
+    content: Option<String>,
+    source: Option<String>,
+    created_at: String,
+}
+
+impl EventRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            seq: row.get(0)?,
+            volume_id: row.get(1)?,
+            event_type: row.get(2)?,
+            entry_id: row.get(3)?,
+            content: row.get(4)?,
+            source: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    }
+
+    fn into_event(self) -> Result<Event> {
+        let source = self.source.as_deref().map(str::parse).transpose()?;
+        Ok(Event::new(
+            self.seq,
+            self.volume_id,
+            self.event_type.parse()?,
+            self.entry_id,
+            self.content,
+            source,
+            parse_datetime(&self.created_at)?,
+        )?)
+    }
+}
+
+const VOLUME_COLS: &str = "id, name, created_at, parent_snapshot_id";
+
+fn volume_from_parts(
+    id: VolumeId,
+    name: String,
+    created_at: String,
+    parent: Option<SnapshotId>,
+) -> Result<Volume> {
+    Ok(Volume::new(id, name, parse_datetime(&created_at)?, parent)?)
+}
+
+const SNAPSHOT_COLS: &str = "id, volume_id, event_seq_pointer, created_at, label";
+
+fn snapshot_from_parts(
+    id: SnapshotId,
+    volume_id: VolumeId,
+    pointer: SeqNumber,
+    created_at: String,
+    label: String,
+) -> Result<Snapshot> {
+    Ok(Snapshot::new(
+        id,
+        volume_id,
+        pointer,
+        parse_datetime(&created_at)?,
+        label,
+    )?)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn load_entry_row(conn: &Connection, entry_id: EntryId) -> Result<EntryRow> {
+    conn.query_row(
+        &format!("SELECT {ENTRY_COLS} FROM entries WHERE id = ?1"),
+        [entry_id],
+        EntryRow::from_row,
+    )
+    .optional()?
+    .ok_or(EngineError::EntryNotFound(entry_id))
+}
+
+fn head_seq(conn: &Connection, volume_id: VolumeId) -> Result<SeqNumber> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE volume_id = ?1",
+        [volume_id],
+        |row| row.get(0),
+    )?)
+}
+
+fn volume_name_taken(conn: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM volumes WHERE name = ?1",
+        [name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Appends one event to a volume's log and returns its sequence number.
+fn append_event(
+    conn: &Connection,
+    volume_id: VolumeId,
+    event_type: EventType,
+    entry_id: EntryId,
+    content: Option<&str>,
+    source: Option<EntrySource>,
+    at: &str,
+) -> Result<SeqNumber> {
+    let seq = head_seq(conn, volume_id)? + 1;
+    conn.execute(
+        &format!("INSERT INTO events ({EVENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+        (
+            seq,
+            volume_id,
+            event_type.as_str(),
+            entry_id,
+            content,
+            source.map(|s| s.as_str()),
+            at,
+        ),
+    )?;
+    Ok(seq)
+}
+
+/// Applies a non-put event to the entries projection.
+/// Put events insert their projection row before the event is appended.
+fn project_event(
+    conn: &Connection,
+    event_type: EventType,
+    entry_id: EntryId,
+    content: Option<&str>,
+    at: &str,
+) -> Result<()> {
+    match event_type {
+        EventType::PutEntry => {}
+        EventType::UpdateEntry | EventType::RestoreEntry => {
+            conn.execute(
+                "UPDATE entries SET content = ?1, updated_at = ?2, deleted = 0 WHERE id = ?3",
+                (content, at, entry_id),
+            )?;
+        }
+        EventType::DeleteEntry => {
+            conn.execute(
+                "UPDATE entries SET deleted = 1, updated_at = ?1 WHERE id = ?2",
+                (at, entry_id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn load_events(
+    conn: &Connection,
+    volume_id: VolumeId,
+    up_to: Option<SeqNumber>,
+) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM events
+            WHERE volume_id = ?1 AND seq <= ?2
+            ORDER BY seq ASC"
+    ))?;
+    let rows = stmt
+        .query_map((volume_id, up_to.unwrap_or(i64::MAX)), EventRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(EventRow::into_event).collect()
+}
+
+fn create_volume_inner(
+    conn: &Connection,
+    name: String,
+    parent_snapshot_id: Option<SnapshotId>,
+) -> Result<Volume> {
+    if name.trim().is_empty() {
+        return Err(DomainError::EmptyVolumeName.into());
+    }
+    if volume_name_taken(conn, &name)? {
+        return Err(EngineError::VolumeNameTaken(name));
+    }
+    let now = Utc::now();
+    conn.execute(
+        "INSERT INTO volumes (name, created_at, parent_snapshot_id) VALUES (?1, ?2, ?3)",
+        (&name, now.to_rfc3339(), parent_snapshot_id),
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(Volume::new(id, name, now, parent_snapshot_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+/// The state of one entry as reconstructed from the event log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayedEntry {
+    content: String,
+    source: EntrySource,
+    created_at: String,
+    updated_at: String,
+    deleted: bool,
+}
+
+/// Folds a volume's events into the state of every entry it has ever had, deleted or not.
+fn replay(events: &[Event]) -> Result<BTreeMap<EntryId, ReplayedEntry>> {
+    let mut state: BTreeMap<EntryId, ReplayedEntry> = BTreeMap::new();
+
+    for ev in events {
+        let at = ev.created_at().to_rfc3339();
+        let bad = |why: &str| {
+            EngineError::Corrupt(format!(
+                "volume {} event {}: {} on entry {} {why}",
+                ev.volume_id(),
+                ev.seq(),
+                ev.event_type().as_str(),
+                ev.entry_id()
+            ))
+        };
+        let content = || ev.content().unwrap_or_default().to_string();
+
+        match ev.event_type() {
+            EventType::PutEntry => {
+                if state.contains_key(&ev.entry_id()) {
+                    return Err(bad("which already exists"));
+                }
+                state.insert(
+                    ev.entry_id(),
+                    ReplayedEntry {
+                        content: content(),
+                        source: ev.source().unwrap_or(EntrySource::User),
+                        created_at: at.clone(),
+                        updated_at: at,
+                        deleted: false,
+                    },
+                );
+            }
+            EventType::UpdateEntry => {
+                let e = state
+                    .get_mut(&ev.entry_id())
+                    .ok_or_else(|| bad("which does not exist"))?;
+                if e.deleted {
+                    return Err(bad("which is deleted"));
+                }
+                e.content = content();
+                e.updated_at = at;
+            }
+            EventType::DeleteEntry => {
+                let e = state
+                    .get_mut(&ev.entry_id())
+                    .ok_or_else(|| bad("which does not exist"))?;
+                if e.deleted {
+                    return Err(bad("which is already deleted"));
+                }
+                e.deleted = true;
+                e.updated_at = at;
+            }
+            EventType::RestoreEntry => {
+                let e = state
+                    .get_mut(&ev.entry_id())
+                    .ok_or_else(|| bad("which does not exist"))?;
+                if !e.deleted {
+                    return Err(bad("which is not deleted"));
+                }
+                e.content = content();
+                e.deleted = false;
+                e.updated_at = at;
+            }
+        }
+    }
+
+    Ok(state)
+}
+
+fn live_entries(
+    volume_id: VolumeId,
+    state: BTreeMap<EntryId, ReplayedEntry>,
+) -> Result<BTreeMap<EntryId, Entry>> {
+    state
+        .into_iter()
+        .filter(|(_, e)| !e.deleted)
+        .map(|(id, e)| {
+            let entry = Entry::new(
+                id,
+                volume_id,
+                e.content,
+                parse_datetime(&e.created_at)?,
+                parse_datetime(&e.updated_at)?,
+                e.source,
+            )?;
+            Ok((id, entry))
+        })
+        .collect()
+}
+
+fn state_map_at(
+    conn: &Connection,
+    volume_id: VolumeId,
+    seq: SeqNumber,
+) -> Result<BTreeMap<EntryId, Entry>> {
+    if seq < 0 {
+        return Err(DomainError::InvalidSeqNumber.into());
+    }
+    let events = load_events(conn, volume_id, Some(seq))?;
+    live_entries(volume_id, replay(&events)?)
+}
+
+fn rebuild_projection_inner(conn: &Connection, volume_id: VolumeId) -> Result<usize> {
+    let replayed = replay(&load_events(conn, volume_id, None)?)?;
+
+    let rows = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ENTRY_COLS} FROM entries WHERE volume_id = ?1"
+        ))?;
+        stmt.query_map([volume_id], EntryRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut corrected = 0;
+    for row in rows {
+        match replayed.get(&row.id) {
+            Some(r) => {
+                let in_sync = row.content == r.content
+                    && row.source == r.source.as_str()
+                    && row.created_at == r.created_at
+                    && row.updated_at == r.updated_at
+                    && row.deleted == r.deleted;
+                if !in_sync {
+                    conn.execute(
+                        "UPDATE entries
+                            SET content = ?1, source = ?2, created_at = ?3, updated_at = ?4, deleted = ?5
+                            WHERE id = ?6",
+                        (
+                            &r.content,
+                            r.source.as_str(),
+                            &r.created_at,
+                            &r.updated_at,
+                            r.deleted,
+                            row.id,
+                        ),
+                    )?;
+                    corrected += 1;
+                }
+            }
+            // A row no event ever created is not part of the volume's history.
+            None if !row.deleted => {
+                conn.execute("UPDATE entries SET deleted = 1 WHERE id = ?1", [row.id])?;
+                corrected += 1;
+            }
+            None => {}
+        }
+    }
+    Ok(corrected)
+}
+
+// ---------------------------------------------------------------------------
+// Volumes
+// ---------------------------------------------------------------------------
 
 /// Creates a new isolated memory namespace with the given name
 /// Inserts a row into volumes and returns that created Volume
 pub fn create_volume(conn: &Connection, name: String) -> Result<Volume> {
-    let now = Utc::now();
-    conn.execute(
-        "INSERT INTO volumes (name, created_at) VALUES (?1, ?2)",
-        (&name, now.to_rfc3339()),
-    )?;
-    let id = conn.last_insert_rowid();
-    let vol = Volume::new(id, name, now).map_err(domain_err)?;
-    Ok(vol)
+    create_volume_inner(conn, name, None)
 }
 
-/// Stores a new knowledege entry in the specified volume.
-/// Inserts into entries, then appends a PutEntry event into the EventLog with
+/// Returns a single volume by id
+pub fn get_volume(conn: &Connection, volume_id: VolumeId) -> Result<Volume> {
+    let (id, name, created_at, parent) = conn
+        .query_row(
+            &format!("SELECT {VOLUME_COLS} FROM volumes WHERE id = ?1"),
+            [volume_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or(EngineError::VolumeNotFound(volume_id))?;
+    volume_from_parts(id, name, created_at, parent)
+}
+
+/// Returns all volumes in the database
+pub fn list_volumes(conn: &Connection) -> Result<Vec<Volume>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {VOLUME_COLS} FROM volumes ORDER BY id ASC"
+    ))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(id, name, created_at, parent)| volume_from_parts(id, name, created_at, parent))
+        .collect()
+}
+
+/// Creates a new volume branched from a snapshot.
+/// The snapshot's event history is copied into the new volume (with fresh entry ids), so the
+/// branch keeps the full lineage up to that point and then evolves independently.
+/// When no name is given, `<source>_clone`, `<source>_clone_2`, ... is used.
+pub fn clone_volume(
+    conn: &Connection,
+    snapshot_id: SnapshotId,
+    name: Option<String>,
+) -> Result<Volume> {
+    let tx = conn.unchecked_transaction()?;
+    let snap = get_snapshot(&tx, snapshot_id)?;
+    let source = get_volume(&tx, snap.volume_id())?;
+
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let base = format!("{}_clone", source.name());
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while volume_name_taken(&tx, &candidate)? {
+                candidate = format!("{base}_{n}");
+                n += 1;
+            }
+            candidate
+        }
+    };
+    let new_volume = create_volume_inner(&tx, name, Some(snapshot_id))?;
+
+    let events = load_events(&tx, source.id(), Some(snap.event_seq_pointer()))?;
+
+    // Events reference projection rows, so create a row for every entry first.
+    let mut id_map: HashMap<EntryId, EntryId> = HashMap::new();
+    for ev in events
+        .iter()
+        .filter(|e| e.event_type() == EventType::PutEntry)
+    {
+        let at = ev.created_at().to_rfc3339();
+        tx.execute(
+            "INSERT INTO entries (volume_id, content, created_at, updated_at, source)
+                VALUES (?1, ?2, ?3, ?3, ?4)",
+            (
+                new_volume.id(),
+                ev.content(),
+                &at,
+                ev.source().unwrap_or(EntrySource::User).as_str(),
+            ),
+        )?;
+        id_map.insert(ev.entry_id(), tx.last_insert_rowid());
+    }
+
+    for ev in &events {
+        let entry_id = *id_map.get(&ev.entry_id()).ok_or_else(|| {
+            EngineError::Corrupt(format!(
+                "volume {} event {} references entry {} before it was created",
+                source.id(),
+                ev.seq(),
+                ev.entry_id()
+            ))
+        })?;
+        tx.execute(
+            &format!("INSERT INTO events ({EVENT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+            (
+                ev.seq(),
+                new_volume.id(),
+                ev.event_type().as_str(),
+                entry_id,
+                ev.content(),
+                ev.source().map(|s| s.as_str()),
+                ev.created_at().to_rfc3339(),
+            ),
+        )?;
+    }
+
+    rebuild_projection_inner(&tx, new_volume.id())?;
+    tx.commit()?;
+    Ok(new_volume)
+}
+
+/// Replays a volume's event log and rewrites any projection rows that disagree with it.
+/// Returns the number of entries that were corrected (0 means the projection was intact).
+pub fn rebuild_projection(conn: &Connection, volume_id: VolumeId) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    get_volume(&tx, volume_id)?;
+    let corrected = rebuild_projection_inner(&tx, volume_id)?;
+    tx.commit()?;
+    Ok(corrected)
+}
+
+// ---------------------------------------------------------------------------
+// Entries
+// ---------------------------------------------------------------------------
+
+/// Stores a new knowledge entry in the specified volume.
+/// Inserts into entries, then appends a PutEntry event into the event log with
 /// next seq number for that volume
 pub fn add_entry(
     conn: &Connection,
@@ -34,246 +590,326 @@ pub fn add_entry(
     source: EntrySource,
 ) -> Result<Entry> {
     if content.trim().is_empty() {
-        return Err(domain_err(core_types::DomainError::EmptyEntryContent));
+        return Err(DomainError::EmptyEntryContent.into());
     }
+    let tx = conn.unchecked_transaction()?;
+    get_volume(&tx, volume_id)?;
+
     let now = Utc::now();
-    let source_str = match source {
-        EntrySource::User => "user",
-        EntrySource::Agent => "agent",
-        EntrySource::Tool => "tool",
-    };
-    conn.execute(
-        "INSERT INTO entries (volume_id, content, created_at, source) VALUES (?1, ?2, ?3, ?4)",
-        (volume_id, &content, now.to_rfc3339(), source_str),
+    let at = now.to_rfc3339();
+    tx.execute(
+        "INSERT INTO entries (volume_id, content, created_at, updated_at, source)
+            VALUES (?1, ?2, ?3, ?3, ?4)",
+        (volume_id, &content, &at, source.as_str()),
     )?;
-    let entry_id = conn.last_insert_rowid();
-
-    let next_seq = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE volume_id = ?1",
-        [volume_id],
-        |row| row.get::<_, i64>(0),
+    let entry_id = tx.last_insert_rowid();
+    append_event(
+        &tx,
+        volume_id,
+        EventType::PutEntry,
+        entry_id,
+        Some(&content),
+        Some(source),
+        &at,
     )?;
+    tx.commit()?;
 
-    conn.execute(
-        "INSERT INTO events (seq, volume_id, event_type, entry_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        (next_seq, volume_id, "put_entry", entry_id, now.to_rfc3339())
-    )?;
+    Ok(Entry::new(entry_id, volume_id, content, now, now, source)?)
+}
 
-    let entry = Entry::new(entry_id, volume_id, content, now, source).map_err(domain_err)?;
+/// Returns a live entry by id
+pub fn get_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
+    let row = load_entry_row(conn, entry_id)?;
+    if row.deleted {
+        return Err(EngineError::EntryDeleted(entry_id));
+    }
+    row.into_entry()
+}
+
+/// Replaces the content of an entry, recording an UpdateEntry event.
+/// Writing identical content is a no-op and records nothing.
+pub fn update_entry(conn: &Connection, entry_id: EntryId, content: String) -> Result<Entry> {
+    if content.trim().is_empty() {
+        return Err(DomainError::EmptyEntryContent.into());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let row = load_entry_row(&tx, entry_id)?;
+    if row.deleted {
+        return Err(EngineError::EntryDeleted(entry_id));
+    }
+    if row.content != content {
+        let at = now();
+        append_event(
+            &tx,
+            row.volume_id,
+            EventType::UpdateEntry,
+            entry_id,
+            Some(&content),
+            None,
+            &at,
+        )?;
+        project_event(&tx, EventType::UpdateEntry, entry_id, Some(&content), &at)?;
+    }
+    let entry = load_entry_row(&tx, entry_id)?.into_entry()?;
+    tx.commit()?;
     Ok(entry)
 }
 
-/// Returns all entries in the volume whose content contains the query string
-pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<Vec<Entry>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, volume_id, content, created_at, source 
-            FROM entries 
-            WHERE volume_id = ?1 
-            AND content LIKE '%' || ?2 || '%'",
+/// Removes an entry from the volume's live state, recording a DeleteEntry event.
+/// The entry stays in history and comes back if the volume is rolled back to before the delete.
+/// Returns the entry as it was just before deletion.
+pub fn delete_entry(conn: &Connection, entry_id: EntryId) -> Result<Entry> {
+    let tx = conn.unchecked_transaction()?;
+    let row = load_entry_row(&tx, entry_id)?;
+    if row.deleted {
+        return Err(EngineError::EntryDeleted(entry_id));
+    }
+    let volume_id = row.volume_id;
+    let entry = row.into_entry()?;
+    let at = now();
+    append_event(
+        &tx,
+        volume_id,
+        EventType::DeleteEntry,
+        entry_id,
+        None,
+        None,
+        &at,
     )?;
-
-    let entries = stmt
-        .query_map((volume_id, query), |row| {
-            let source_str: String = row.get(4)?;
-            let source = match source_str.as_str() {
-                "agent" => EntrySource::Agent,
-                "tool" => EntrySource::Tool,
-                _ => EntrySource::User,
-            };
-            let created_at: String = row.get(3)?;
-            Ok(Entry::new(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                parse_datetime(created_at)?,
-                source,
-            )
-            .map_err(domain_err)?)
-        })?
-        .collect::<Result<Vec<Entry>>>()?;
-
-    Ok(entries)
+    project_event(&tx, EventType::DeleteEntry, entry_id, None, &at)?;
+    tx.commit()?;
+    Ok(entry)
 }
+
+/// Returns all live entries for a given volume, ordered by insertion
+pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>> {
+    get_volume(conn, volume_id)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ENTRY_COLS} FROM entries WHERE volume_id = ?1 AND deleted = 0 ORDER BY id ASC"
+    ))?;
+    let rows = stmt
+        .query_map([volume_id], EntryRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(EntryRow::into_entry).collect()
+}
+
+/// Returns all live entries in the volume whose content contains the query string
+/// (case-insensitive for ASCII; `%` and `_` are matched literally)
+pub fn search(conn: &Connection, volume_id: VolumeId, query: String) -> Result<Vec<Entry>> {
+    get_volume(conn, volume_id)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ENTRY_COLS} FROM entries
+            WHERE volume_id = ?1
+            AND deleted = 0
+            AND instr(lower(content), lower(?2)) > 0
+            ORDER BY id ASC"
+    ))?;
+    let rows = stmt
+        .query_map((volume_id, query), EntryRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(EntryRow::into_entry).collect()
+}
+
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
+
+/// Returns a volume's full event log, oldest first
+pub fn list_events(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Event>> {
+    get_volume(conn, volume_id)?;
+    load_events(conn, volume_id, None)
+}
+
+/// Returns every event that touched one entry, oldest first
+pub fn entry_history(conn: &Connection, entry_id: EntryId) -> Result<Vec<Event>> {
+    load_entry_row(conn, entry_id)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE entry_id = ?1 ORDER BY seq ASC"
+    ))?;
+    let rows = stmt
+        .query_map([entry_id], EventRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(EventRow::into_event).collect()
+}
+
+/// Reconstructs the live entries of a volume as they were right after event `seq`
+/// (0 is the empty initial state)
+pub fn state_at(conn: &Connection, volume_id: VolumeId, seq: SeqNumber) -> Result<Vec<Entry>> {
+    get_volume(conn, volume_id)?;
+    Ok(state_map_at(conn, volume_id, seq)?.into_values().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
 
 /// Bookmarks the current state of a volume by recording the latest event seq number.
 /// Inserts into snapshots with a human-readable label.
 pub fn snapshot(conn: &Connection, volume_id: VolumeId, label: String) -> Result<Snapshot> {
+    if label.trim().is_empty() {
+        return Err(DomainError::EmptySnapshotLabel.into());
+    }
+    let tx = conn.unchecked_transaction()?;
+    get_volume(&tx, volume_id)?;
     let now = Utc::now();
-    let event_seq_pointer = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE volume_id = ?1",
-        [volume_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    conn.execute(
+    let event_seq_pointer = head_seq(&tx, volume_id)?;
+    tx.execute(
         "INSERT INTO snapshots (volume_id, event_seq_pointer, created_at, label) VALUES (?1, ?2, ?3, ?4)",
         (volume_id, event_seq_pointer, now.to_rfc3339(), &label),
     )?;
-    let id = conn.last_insert_rowid();
-    let snapshot =
-        Snapshot::new(id, volume_id, event_seq_pointer, now, label).map_err(domain_err)?;
-    Ok(snapshot)
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(Snapshot::new(id, volume_id, event_seq_pointer, now, label)?)
 }
 
-/// Creates a new volume and replays all events from the source volume up to the snapshot's event_seq_pointer
-/// copying the relevant entries.
-/// The cloned volume starts as an independent namespace from that point in time.
-pub fn clone_volume(conn: &Connection, snapshot_id: SnapshotId) -> Result<Volume> {
-    let (source_volume_id, event_seq_pointer): (i64, i64) = conn.query_row(
-        "SELECT volume_id, event_seq_pointer FROM snapshots WHERE id = ?1",
-        [snapshot_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    let source_name: String = conn.query_row(
-        "SELECT name FROM volumes WHERE id =?1",
-        [source_volume_id],
-        |row| row.get(0),
-    )?;
-    let new_volume = create_volume(conn, format!("{}_clone", source_name))?;
-    let new_volume_id = new_volume.id();
-
-    let events = {
-        let mut stmt = conn.prepare(
-            "SELECT seq, entry_id FROM events WHERE volume_id = ?1 AND seq <= ?2
-                ORDER BY seq ASC",
-        )?;
-        let rows: Vec<(i64, i64)> = stmt
-            .query_map((source_volume_id, event_seq_pointer), |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        rows
-    };
-
-    for (seq, entry_id) in events {
-        let (content, created_at, source): (String, String, String) = conn.query_row(
-            "SELECT content, created_at, source FROM entries WHERE id = ?1",
-            [entry_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-
-        conn.execute(
-            "INSERT INTO entries (volume_id, content, created_at, source) VALUES (?1, ?2, ?3, ?4)",
-            (new_volume_id, &content, &created_at, &source),
-        )?;
-        let new_entry_id = conn.last_insert_rowid();
-
-        conn.execute(
-            "INSERT INTO events (seq, volume_id, event_type, entry_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (seq, new_volume_id, "put_entry", new_entry_id, &created_at),
-        )?;
-    }
-
-    Ok(new_volume)
-}
-
-/// Returns all volumes in the database
-pub fn list_volumes(conn: &Connection) -> Result<Vec<Volume>> {
-    let mut stmt = conn.prepare("SELECT id, name, created_at FROM volumes")?;
-    let rows = stmt
-        .query_map([], |row| {
-            let created_at: String = row.get(2)?;
-            Ok(
-                Volume::new(row.get(0)?, row.get(1)?, parse_datetime(created_at)?)
-                    .map_err(domain_err)?,
-            )
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+/// Returns a single snapshot by id
+pub fn get_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Result<Snapshot> {
+    let (id, volume_id, pointer, created_at, label) = conn
+        .query_row(
+            &format!("SELECT {SNAPSHOT_COLS} FROM snapshots WHERE id = ?1"),
+            [snapshot_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(EngineError::SnapshotNotFound(snapshot_id))?;
+    snapshot_from_parts(id, volume_id, pointer, created_at, label)
 }
 
 /// Returns all snapshots for a given volume
 pub fn list_snapshots(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Snapshot>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, volume_id, event_seq_pointer, created_at, label FROM snapshots WHERE volume_id = ?1"
-    )?;
+    get_volume(conn, volume_id)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SNAPSHOT_COLS} FROM snapshots WHERE volume_id = ?1 ORDER BY id ASC"
+    ))?;
     let rows = stmt
         .query_map([volume_id], |row| {
-            let created_at: String = row.get(3)?;
-            Ok(Snapshot::new(
+            Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
-                parse_datetime(created_at)?,
+                row.get(3)?,
                 row.get(4)?,
-            )
-            .map_err(domain_err)?)
+            ))
         })?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(id, volume_id, pointer, created_at, label)| {
+            snapshot_from_parts(id, volume_id, pointer, created_at, label)
+        })
+        .collect()
 }
 
-/// Creates all tables if they don't exist. Safe to call on every startup.
-pub fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS volumes (
-            id         INTEGER PRIMARY KEY,
-            name       TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        )",
-        (),
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS entries (
-            id         INTEGER PRIMARY KEY,
-            volume_id  INTEGER NOT NULL REFERENCES volumes(id),
-            content    TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            source     TEXT NOT NULL CHECK (source IN ('user', 'agent', 'tool'))
-        )",
-        (),
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS events (
-            seq        INTEGER NOT NULL,
-            volume_id  INTEGER NOT NULL REFERENCES volumes(id),
-            event_type TEXT NOT NULL CHECK (event_type IN ('put_entry')),
-            entry_id   INTEGER NOT NULL REFERENCES entries(id),
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (volume_id, seq)
-        )",
-        (),
-    )?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS snapshots (
-            id                 INTEGER PRIMARY KEY,
-            volume_id          INTEGER NOT NULL REFERENCES volumes(id),
-            event_seq_pointer  INTEGER NOT NULL,
-            created_at         TEXT NOT NULL,
-            label              TEXT NOT NULL
-        )",
-        (),
-    )?;
-
-    Ok(())
+/// Reconstructs the live entries of a volume as they were when the snapshot was taken
+pub fn entries_at_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Result<Vec<Entry>> {
+    let snap = get_snapshot(conn, snapshot_id)?;
+    state_at(conn, snap.volume_id(), snap.event_seq_pointer())
 }
 
-/// Returns all entries for a given volume, ordered by insertion
-pub fn list_entries(conn: &Connection, volume_id: VolumeId) -> Result<Vec<Entry>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, volume_id, content, created_at, source FROM entries WHERE volume_id = ?1 ORDER BY id ASC",
-    )?;
-    let rows = stmt
-        .query_map([volume_id], |row| {
-            let source_str: String = row.get(4)?;
-            let source = match source_str.as_str() {
-                "agent" => EntrySource::Agent,
-                "tool" => EntrySource::Tool,
-                _ => EntrySource::User,
-            };
-            let created_at: String = row.get(3)?;
-            Ok(Entry::new(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                parse_datetime(created_at)?,
-                source,
-            )
-            .map_err(domain_err)?)
-        })?
-        .collect::<Result<Vec<_>>>()?;
-    Ok(rows)
+/// Compares two points in a volume's history
+pub fn diff(
+    conn: &Connection,
+    volume_id: VolumeId,
+    from_seq: SeqNumber,
+    to_seq: SeqNumber,
+) -> Result<MemoryDiff> {
+    get_volume(conn, volume_id)?;
+    let before = state_map_at(conn, volume_id, from_seq)?;
+    let mut after = state_map_at(conn, volume_id, to_seq)?;
+
+    let mut result = MemoryDiff {
+        from_seq,
+        to_seq,
+        ..MemoryDiff::default()
+    };
+    for (id, old) in before {
+        match after.remove(&id) {
+            None => result.removed.push(old),
+            Some(new) if new.content() != old.content() => {
+                result.modified.push(EntryModification {
+                    before: old,
+                    after: new,
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    result.added = after.into_values().collect();
+    Ok(result)
+}
+
+/// Compares a snapshot against a later (or earlier) snapshot of the same volume,
+/// or against the volume's current state when `to` is None
+pub fn diff_snapshots(
+    conn: &Connection,
+    from: SnapshotId,
+    to: Option<SnapshotId>,
+) -> Result<MemoryDiff> {
+    let from_snap = get_snapshot(conn, from)?;
+    let to_seq = match to {
+        Some(to_id) => {
+            let to_snap = get_snapshot(conn, to_id)?;
+            if to_snap.volume_id() != from_snap.volume_id() {
+                return Err(EngineError::SnapshotVolumeMismatch { from, to: to_id });
+            }
+            to_snap.event_seq_pointer()
+        }
+        None => head_seq(conn, from_snap.volume_id())?,
+    };
+    diff(
+        conn,
+        from_snap.volume_id(),
+        from_snap.event_seq_pointer(),
+        to_seq,
+    )
+}
+
+/// Returns the snapshot's volume to the state it had when the snapshot was taken.
+/// History is never rewritten: compensating update/delete/restore events are appended,
+/// so the rollback itself shows up in the log and can be undone by rolling back again.
+pub fn rollback_to_snapshot(conn: &Connection, snapshot_id: SnapshotId) -> Result<RollbackReport> {
+    let tx = conn.unchecked_transaction()?;
+    let snap = get_snapshot(&tx, snapshot_id)?;
+    let volume_id = snap.volume_id();
+
+    let events = load_events(&tx, volume_id, None)?;
+    let from_seq = events.last().map_or(0, Event::seq);
+    let current = replay(&events)?;
+    let target = state_map_at(&tx, volume_id, snap.event_seq_pointer())?;
+
+    let at = now();
+    let mut events_appended = 0;
+    for (id, cur) in &current {
+        let change = match target.get(id) {
+            Some(want) if cur.deleted => Some((EventType::RestoreEntry, Some(want.content()))),
+            Some(want) if cur.content != want.content() => {
+                Some((EventType::UpdateEntry, Some(want.content())))
+            }
+            Some(_) => None,
+            None if !cur.deleted => Some((EventType::DeleteEntry, None)),
+            None => None,
+        };
+        if let Some((event_type, content)) = change {
+            append_event(&tx, volume_id, event_type, *id, content, None, &at)?;
+            project_event(&tx, event_type, *id, content, &at)?;
+            events_appended += 1;
+        }
+    }
+
+    let to_seq = head_seq(&tx, volume_id)?;
+    tx.commit()?;
+    Ok(RollbackReport {
+        volume_id,
+        snapshot_id,
+        from_seq,
+        to_seq,
+        events_appended,
+    })
 }
