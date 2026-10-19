@@ -1129,3 +1129,61 @@ fn migration_links_existing_clones_to_their_origins() {
     assert_eq!(contents(&report.added), ["branch only"]);
     assert_eq!(live(&conn, main), ["shared fact", "branch only"]);
 }
+
+#[test]
+fn changes_that_arrived_through_another_volume_are_not_reapplied() {
+    let conn = db();
+    let (main, left, snap) = main_and_branch(&conn);
+    let right = clone_volume(&conn, snap.id(), Some("right".into()))
+        .unwrap()
+        .id();
+    let shared = entry_id_with(&conn, left, "shared fact");
+
+    // Left's changes reach right through main.
+    add_entry(&conn, left, "from left".into(), EntrySource::User, vec![]).unwrap();
+    update_entry(&conn, shared, "edited on left".into()).unwrap();
+    merge_volumes(&conn, left, main, false).unwrap();
+    merge_volumes(&conn, main, right, false).unwrap();
+
+    // Right then deletes one and reverts the other.
+    delete_entry(&conn, entry_id_with(&conn, right, "from left")).unwrap();
+    let right_shared = entry_id_with(&conn, right, "edited on left");
+    update_entry(&conn, right_shared, "shared fact".into()).unwrap();
+
+    // Merging left into right directly must not undo right's later choices.
+    let report = merge_volumes(&conn, left, right, false).unwrap();
+    assert_eq!(report.events_appended, 0);
+    assert_eq!(live(&conn, right), ["shared fact"]);
+}
+
+#[test]
+fn migration_links_long_clone_chains_quickly() {
+    let conn = db();
+    let mut volume = create_volume(&conn, "root".into()).unwrap().id();
+    for i in 0..1000 {
+        add_entry(
+            &conn,
+            volume,
+            format!("fact {i}"),
+            EntrySource::User,
+            vec![],
+        )
+        .unwrap();
+    }
+    for depth in 0..4 {
+        let snap = snapshot(&conn, volume, format!("level {depth}")).unwrap();
+        volume = clone_volume(&conn, snap.id(), None).unwrap().id();
+    }
+    conn.execute_batch(
+        "ALTER TABLE entries DROP COLUMN origin_entry_id;
+         ALTER TABLE snapshots DROP COLUMN merged_into_volume_id;
+         PRAGMA user_version = 3;",
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    init_db(&conn).unwrap();
+    // The first version of this migration took minutes on a chain like this one.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(diff_volumes(&conn, 1, volume).unwrap().is_empty());
+}

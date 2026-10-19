@@ -67,6 +67,9 @@ The database schema is versioned with `PRAGMA user_version`, and databases creat
 | `diff_volumes`         | Compare two volumes, e.g. a branch and its parent               |
 | `merge_volumes`        | Apply a branch's changes to a related volume (with dry run)     |
 
+Diff tools (`diff_snapshots`, `diff_volumes`) return full entries, with tags, as `before` and
+`after` of each modified entry. Before cross-branch merge they returned plain strings.
+
 ## Getting started
 
 ### Prerequisites

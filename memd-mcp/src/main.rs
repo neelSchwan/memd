@@ -328,7 +328,7 @@ impl MemdServer {
     /// Merge one volume's changes into a related volume
     #[tool(
         name = "merge_volumes",
-        description = "Apply the memory changes made on one volume (usually a branch) to a related volume, such as the volume it was branched from. History is preserved: changes are recorded as new events on the target. Entries changed differently on both sides are left alone and returned as conflicts; to take the source's version, update the target's entry with update_memory. Run with dry_run first to preview."
+        description = "Apply the memory changes made on one volume (usually a branch) to a related volume, such as the volume it was branched from. History is preserved: changes are recorded as new events on the target. Entries changed differently on both sides are left alone and returned as conflicts; to take the source's version, update the target's entry with update_memory, or add it again with remember if the target deleted it. Run with dry_run first to preview."
     )]
     pub async fn merge_volumes(
         &self,
@@ -679,6 +679,7 @@ pub struct EventListResponse {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ModifiedEntryResponse {
+    /// ID of the `before` entry (in diff_volumes, the entry in the `from` volume).
     pub entry_id: i64,
     pub before: EntryResponse,
     pub after: EntryResponse,

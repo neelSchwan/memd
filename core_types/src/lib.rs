@@ -461,7 +461,8 @@ pub struct MergeConflict {
 }
 
 /// Outcome of merging one volume into another.
-/// Merge never rewrites history: it appends events to the target.
+/// Merge never rewrites history: it appends events to the target, and a real merge that changed
+/// anything or found conflicts records a "merged into <target>" snapshot on the source.
 #[derive(Debug, Clone)]
 pub struct MergeReport {
     pub source_volume_id: VolumeId,

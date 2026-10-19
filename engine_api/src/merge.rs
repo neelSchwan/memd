@@ -5,15 +5,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use chrono::{DateTime, Utc};
 use core_types::{
     Entry, EntryId, EntryModification, EventType, MergeConflict, MergeReport, SeqNumber,
-    VolumeDiff, VolumeId,
+    SnapshotId, VolumeDiff, VolumeId,
 };
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::{
-    EngineError, EntryData, Result, append_event, entry_data, entry_origins, get_snapshot,
-    get_volume, head_seq, insert_entry_row, join_tags, now, project_event, state_map_at, write_tx,
+    EngineError, EntryData, Result, append_event, compare_states, entry_data, entry_origins,
+    get_snapshot, get_volume, head_seq, insert_entry_row, join_tags, load_events, now,
+    project_event, state_map_at, write_tx,
 };
 
 /// Live entries of a volume as of `seq`, keyed by origin.
@@ -39,7 +41,7 @@ pub fn diff_volumes(conn: &Connection, from: VolumeId, to: VolumeId) -> Result<V
     get_volume(conn, from)?;
     get_volume(conn, to)?;
     let (added, removed, modified) =
-        crate::compare_states(current_by_origin(conn, from)?, current_by_origin(conn, to)?);
+        compare_states(current_by_origin(conn, from)?, current_by_origin(conn, to)?);
     Ok(VolumeDiff {
         from_volume_id: from,
         to_volume_id: to,
@@ -62,32 +64,53 @@ fn lineage(conn: &Connection, volume_id: VolumeId) -> Result<Vec<(VolumeId, SeqN
     Ok(chain)
 }
 
-/// The state both volumes last agreed on, as (volume, seq): the most recent merge between them,
-/// or else the point where their histories split.
-fn merge_base(
-    conn: &Connection,
-    source: VolumeId,
-    target: VolumeId,
-) -> Result<(VolumeId, SeqNumber)> {
+/// The state both volumes last agreed on.
+struct MergeBase {
+    volume_id: VolumeId,
+    seq: SeqNumber,
+    /// When that state was current. Target history after this moment is the target's own;
+    /// anything earlier is history both sides share.
+    since: DateTime<Utc>,
+}
+
+/// Finds the most recent merge between the two volumes, or else the point where their histories
+/// split.
+fn merge_base(conn: &Connection, source: VolumeId, target: VolumeId) -> Result<MergeBase> {
     // A merge leaves a snapshot on its source at the seq the target took in.
-    let last_merge = conn
+    let last_merge: Option<SnapshotId> = conn
         .query_row(
-            "SELECT volume_id, event_seq_pointer FROM snapshots
+            "SELECT id FROM snapshots
                 WHERE (volume_id = ?1 AND merged_into_volume_id = ?2)
                    OR (volume_id = ?2 AND merged_into_volume_id = ?1)
                 ORDER BY id DESC LIMIT 1",
             (source, target),
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    if let Some(base) = last_merge {
-        return Ok(base);
+    if let Some(snapshot_id) = last_merge {
+        let snap = get_snapshot(conn, snapshot_id)?;
+        return Ok(MergeBase {
+            volume_id: snap.volume_id(),
+            seq: snap.event_seq_pointer(),
+            since: snap.created_at(),
+        });
     }
 
     let target_lineage = lineage(conn, target)?;
     for (volume_id, source_seq) in lineage(conn, source)? {
         if let Some((_, target_seq)) = target_lineage.iter().find(|(v, _)| *v == volume_id) {
-            return Ok((volume_id, source_seq.min(*target_seq)));
+            let seq = source_seq.min(*target_seq);
+            // Clones copy events with their original timestamps, so this splits the target's
+            // history into the part it shares with the source and the part after.
+            let since = match load_events(conn, volume_id, Some(seq))?.last() {
+                Some(event) => event.created_at(),
+                None => DateTime::<Utc>::MIN_UTC,
+            };
+            return Ok(MergeBase {
+                volume_id,
+                seq,
+                since,
+            });
         }
     }
     Err(EngineError::VolumesNotRelated { source, target })
@@ -142,14 +165,142 @@ fn write_change(conn: &Connection, target: VolumeId, write: &Write, at: &str) ->
     Ok(())
 }
 
+/// The versions (content and tags) entries have had, keyed by entry id.
+type Versions = HashMap<EntryId, Vec<(String, Vec<String>)>>;
+
+/// Every version each entry of a volume has had after `since`.
+fn versions_since(
+    conn: &Connection,
+    volume_id: VolumeId,
+    since: DateTime<Utc>,
+) -> Result<Versions> {
+    let mut versions = Versions::new();
+    let events = load_events(conn, volume_id, None)?;
+    for event in events.iter().filter(|event| event.created_at() > since) {
+        if let Some(content) = event.content() {
+            versions
+                .entry(event.entry_id())
+                .or_default()
+                .push((content.to_string(), event.tags().to_vec()));
+        }
+    }
+    Ok(versions)
+}
+
+/// What a merge changes: the report's entry lists, plus the writes that make those changes.
+struct MergePlan<'a> {
+    added: Vec<Entry>,
+    removed: Vec<Entry>,
+    modified: Vec<EntryModification>,
+    conflicts: Vec<MergeConflict>,
+    writes: Vec<Write<'a>>,
+}
+
+/// Decides, entry by entry, what merging the source into the target changes. All maps are keyed
+/// by origin except `target_versions` (the target's versions since the base), which is keyed by
+/// the target's entry ids.
+fn plan_merge<'a>(
+    base: &BTreeMap<EntryId, Entry>,
+    source_entries: &'a BTreeMap<EntryId, Entry>,
+    target_entries: &BTreeMap<EntryId, Entry>,
+    target_ids: &HashMap<EntryId, EntryId>,
+    target_versions: &Versions,
+) -> MergePlan<'a> {
+    let mut plan = MergePlan {
+        added: Vec::new(),
+        removed: Vec::new(),
+        modified: Vec::new(),
+        conflicts: Vec::new(),
+        writes: Vec::new(),
+    };
+    let all_origins: BTreeSet<EntryId> = base
+        .keys()
+        .chain(source_entries.keys())
+        .chain(target_entries.keys())
+        .copied()
+        .collect();
+
+    for origin in all_origins {
+        let base_entry = base.get(&origin);
+        let source_entry = source_entries.get(&origin);
+        let target_entry = target_entries.get(&origin);
+        let source_data = entry_data(source_entry);
+        if source_data == entry_data(target_entry) || source_data == entry_data(base_entry) {
+            continue;
+        }
+        // Since the base, the target already held this exact version, for example through a merge
+        // via another volume, and has moved on. Its later choice wins.
+        let target_had_it = target_ids
+            .get(&origin)
+            .and_then(|entry_id| target_versions.get(entry_id))
+            .is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|(content, tags)| Some((content.as_str(), tags.as_slice())) == source_data)
+            });
+        if target_had_it {
+            continue;
+        }
+        if entry_data(target_entry) != entry_data(base_entry) {
+            plan.conflicts.push(MergeConflict {
+                base: base_entry.cloned(),
+                source: source_entry.cloned(),
+                target: target_entry.cloned(),
+            });
+            continue;
+        }
+
+        // Only the source changed this entry since the base: bring its version over.
+        match (source_entry, target_entry) {
+            (Some(new), Some(old)) => {
+                plan.writes.push(Write::Existing {
+                    event_type: EventType::UpdateEntry,
+                    entry_id: old.id(),
+                    entry: Some(new),
+                });
+                plan.modified.push(EntryModification {
+                    before: old.clone(),
+                    after: new.clone(),
+                });
+            }
+            (Some(new), None) => {
+                plan.writes.push(match target_ids.get(&origin) {
+                    Some(&entry_id) => Write::Existing {
+                        event_type: EventType::RestoreEntry,
+                        entry_id,
+                        entry: Some(new),
+                    },
+                    None => Write::New { origin, entry: new },
+                });
+                plan.added.push(new.clone());
+            }
+            (None, Some(old)) => {
+                plan.writes.push(Write::Existing {
+                    event_type: EventType::DeleteEntry,
+                    entry_id: old.id(),
+                    entry: None,
+                });
+                plan.removed.push(old.clone());
+            }
+            // Absent on both sides compares equal, so it was skipped above.
+            (None, None) => {}
+        }
+    }
+    plan
+}
+
 /// Applies the changes `source` made since its common base with `target` to `target`.
 ///
 /// Every entry is compared three ways: base, source and target. A change made only on the source
 /// is applied to the target by appending events, so history is never rewritten. A change made
-/// only on the target is kept. An entry changed differently on both sides is a conflict: it is
-/// left alone and reported. After a merge, a reported conflict counts as settled in favor of the
-/// target; to take the source's version, update the target's entry.
+/// only on the target is kept, and so is a target that already held the source's version and has
+/// changed it since. An entry changed differently on both sides is a conflict: it is left alone
+/// and reported. After a merge, a reported conflict counts as settled in favor of the target; to
+/// take the source's version, update the target's entry (or add it again if the target deleted
+/// it).
 ///
+/// A real merge that changed anything or found conflicts also leaves a "merged into <target>"
+/// snapshot on the source, which marks the base for the next merge between the two volumes.
 /// With `dry_run`, nothing is written and the report shows what a real merge would do.
 pub fn merge_volumes(
     conn: &Connection,
@@ -160,89 +311,43 @@ pub fn merge_volumes(
     let tx = write_tx(conn)?;
     get_volume(&tx, source)?;
     let target_volume = get_volume(&tx, target)?;
-    let (base_volume_id, base_seq) = merge_base(&tx, source, target)?;
+    let merge_base = merge_base(&tx, source, target)?;
 
-    let base = live_by_origin(&tx, base_volume_id, base_seq)?;
-    let theirs = current_by_origin(&tx, source)?;
-    let ours = current_by_origin(&tx, target)?;
+    let base = live_by_origin(&tx, merge_base.volume_id, merge_base.seq)?;
+    let source_entries = current_by_origin(&tx, source)?;
+    let target_entries = current_by_origin(&tx, target)?;
     // Deleted target entries are included so they get restored rather than duplicated.
     let target_ids: HashMap<EntryId, EntryId> = entry_origins(&tx, target)?
         .into_iter()
         .map(|(id, origin)| (origin, id))
         .collect();
+    let target_versions = versions_since(&tx, target, merge_base.since)?;
 
-    let mut report = MergeReport {
+    let MergePlan {
+        added,
+        removed,
+        modified,
+        conflicts,
+        writes,
+    } = plan_merge(
+        &base,
+        &source_entries,
+        &target_entries,
+        &target_ids,
+        &target_versions,
+    );
+    let report = MergeReport {
         source_volume_id: source,
         target_volume_id: target,
-        base_volume_id,
-        base_seq,
+        base_volume_id: merge_base.volume_id,
+        base_seq: merge_base.seq,
         dry_run,
-        added: Vec::new(),
-        removed: Vec::new(),
-        modified: Vec::new(),
-        conflicts: Vec::new(),
-        events_appended: 0,
+        added,
+        removed,
+        modified,
+        conflicts,
+        events_appended: writes.len(),
     };
-    let mut writes = Vec::new();
-    let all_origins: BTreeSet<EntryId> = base
-        .keys()
-        .chain(theirs.keys())
-        .chain(ours.keys())
-        .copied()
-        .collect();
-    for origin in all_origins {
-        let base_entry = base.get(&origin);
-        let source_entry = theirs.get(&origin);
-        let target_entry = ours.get(&origin);
-        let source_data = entry_data(source_entry);
-        if source_data == entry_data(target_entry) || source_data == entry_data(base_entry) {
-            continue;
-        }
-        if entry_data(target_entry) != entry_data(base_entry) {
-            report.conflicts.push(MergeConflict {
-                base: base_entry.cloned(),
-                source: source_entry.cloned(),
-                target: target_entry.cloned(),
-            });
-            continue;
-        }
-
-        // Only the source changed this entry since the base: bring its version over.
-        match (source_entry, target_entry) {
-            (None, Some(old)) => {
-                writes.push(Write::Existing {
-                    event_type: EventType::DeleteEntry,
-                    entry_id: old.id(),
-                    entry: None,
-                });
-                report.removed.push(old.clone());
-            }
-            (Some(new), Some(old)) => {
-                writes.push(Write::Existing {
-                    event_type: EventType::UpdateEntry,
-                    entry_id: old.id(),
-                    entry: Some(new),
-                });
-                report.modified.push(EntryModification {
-                    before: old.clone(),
-                    after: new.clone(),
-                });
-            }
-            (Some(new), None) => {
-                writes.push(match target_ids.get(&origin) {
-                    Some(&entry_id) => Write::Existing {
-                        event_type: EventType::RestoreEntry,
-                        entry_id,
-                        entry: Some(new),
-                    },
-                    None => Write::New { origin, entry: new },
-                });
-                report.added.push(new.clone());
-            }
-            (None, None) => unreachable!("absent on both sides compares equal above"),
-        }
-    }
-    report.events_appended = writes.len();
 
     if dry_run || (writes.is_empty() && report.conflicts.is_empty()) {
         return Ok(report);

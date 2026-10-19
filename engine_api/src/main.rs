@@ -178,7 +178,11 @@ fn print_diff(diff: &MemoryDiff) {
 }
 
 fn print_merge(report: &MergeReport) {
-    print_changes(&report.added, &report.removed, &report.modified);
+    let applied_nothing =
+        report.added.is_empty() && report.removed.is_empty() && report.modified.is_empty();
+    if !applied_nothing || report.conflicts.is_empty() {
+        print_changes(&report.added, &report.removed, &report.modified);
+    }
     let describe = |entry: &Option<Entry>| match entry {
         Some(e) => with_tags(e.content(), e.tags()),
         None => "(deleted)".to_string(),

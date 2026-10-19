@@ -80,8 +80,19 @@ merge like any other change. It lives in `engine_api/src/merge.rs`.
 **Conflicts are reported and skipped.** Agents often merge without reading the preview, and "theirs
 wins" would silently overwrite the target's edits. After a merge, the base moves past a skipped
 conflict, so it counts as settled in favor of the target. To take the source's version, update the
-target's entry. Rolling a target back to before a merge also sticks: re-merging won't re-apply the
-source's unchanged entries.
+target's entry, or add it again if the target deleted it.
+
+**A version the target already held since the base is not re-applied.** Changes can reach a target
+through a third volume (left → main → right). The base between left and right is still their fork
+point, so without this rule merging left into right directly would undo right's later deletions
+and reverts. "Since the base" is measured in time: clones copy events with their original
+timestamps, so target events newer than the base are the target's own. This also makes rolling a
+target back to before a merge stick.
+
+**The v4 migration links clones in a loop, not a recursive query.** A clone always has a larger id
+than its source, so going through volumes in id order lets each clone copy its source's
+already-set origins with one indexed `UPDATE`. The first version used a recursive CTE and took
+minutes on a 10,000-entry clone chain; `migration_links_long_clone_chains_quickly` guards this.
 
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.

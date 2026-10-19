@@ -103,41 +103,48 @@ const MIGRATE_V2_TO_V3: &str = "
 
 /// Entry origins, so the same entry can be recognized across a volume and its branches, and the
 /// merge bookmark on snapshots. Both are plain integers: entry rows are never deleted, so a foreign
-/// key would add nothing.
-///
-/// Existing clones are linked up during migration. `clone_volume` copies a snapshot's events into
-/// the new volume in order, so the clone's put at seq N is a copy of the source's put at seq N.
-/// Those pairs are linked, then followed to the root so clones of clones point at the original.
+/// key would add nothing. Existing clones are linked up by `link_existing_clones`.
 const MIGRATE_V3_TO_V4: &str = "
     ALTER TABLE entries ADD COLUMN origin_entry_id INTEGER;
     ALTER TABLE snapshots ADD COLUMN merged_into_volume_id INTEGER;
-
-    WITH RECURSIVE
-        copied_from(entry_id, source_entry_id) AS (
-            SELECT clone_ev.entry_id, source_ev.entry_id
-            FROM volumes v
-            JOIN snapshots s ON s.id = v.parent_snapshot_id
-            JOIN events clone_ev ON clone_ev.volume_id = v.id
-                AND clone_ev.seq <= s.event_seq_pointer
-            JOIN events source_ev ON source_ev.volume_id = s.volume_id
-                AND source_ev.seq = clone_ev.seq
-            WHERE clone_ev.event_type = 'put_entry'
-                AND source_ev.event_type = 'put_entry'
-                AND clone_ev.content IS source_ev.content
-        ),
-        ancestor(entry_id, ancestor_id) AS (
-            SELECT entry_id, source_entry_id FROM copied_from
-            UNION ALL
-            SELECT a.entry_id, c.source_entry_id
-            FROM ancestor a JOIN copied_from c ON c.entry_id = a.ancestor_id
-        )
-    UPDATE entries SET origin_entry_id = (
-        SELECT ancestor_id FROM ancestor
-        WHERE ancestor.entry_id = entries.id
-            AND ancestor_id NOT IN (SELECT entry_id FROM copied_from)
-    )
-    WHERE id IN (SELECT entry_id FROM copied_from);
 ";
+
+/// Sets `origin_entry_id` on entries of volumes created by cloning before v4.
+///
+/// `clone_volume` copies a snapshot's events into the new volume in order, so a clone's put at
+/// seq N is a copy of its source's put at seq N; the content check guards that pairing. A clone
+/// always has a larger id than its source, so going through volumes in id order means the source's
+/// origins are already set, and a clone of a clone points straight at the original entry.
+fn link_existing_clones(tx: &Transaction) -> Result<()> {
+    let clones: Vec<(i64, i64, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT v.id, s.volume_id, s.event_seq_pointer
+                FROM volumes v JOIN snapshots s ON s.id = v.parent_snapshot_id
+                ORDER BY v.id",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (clone_id, source_id, fork_seq) in clones {
+        tx.execute(
+            "UPDATE entries SET origin_entry_id = (
+                SELECT COALESCE(source.origin_entry_id, source.id)
+                FROM events clone_ev
+                JOIN events source_ev ON source_ev.volume_id = ?2 AND source_ev.seq = clone_ev.seq
+                JOIN entries source ON source.id = source_ev.entry_id
+                WHERE clone_ev.volume_id = ?1
+                    AND clone_ev.entry_id = entries.id
+                    AND clone_ev.event_type = 'put_entry'
+                    AND source_ev.event_type = 'put_entry'
+                    AND clone_ev.seq <= ?3
+                    AND clone_ev.content IS source_ev.content
+            )
+            WHERE volume_id = ?1",
+            (clone_id, source_id, fork_seq),
+        )?;
+    }
+    Ok(())
+}
 
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
@@ -182,6 +189,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if version < 4 {
         tx.execute_batch(MIGRATE_V3_TO_V4)?;
+        link_existing_clones(&tx)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
