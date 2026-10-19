@@ -73,9 +73,14 @@ impl MemdServer {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
 
-        let entry =
-            engine_api::add_entry(&conn, request.volume_id, request.content, request.source)
-                .map_err(|e| e.to_string())?;
+        let entry = engine_api::add_entry(
+            &conn,
+            request.volume_id,
+            request.content,
+            request.source,
+            request.tags,
+        )
+        .map_err(|e| e.to_string())?;
 
         Ok(Json(EntryResponse::from(&entry)))
     }
@@ -92,8 +97,8 @@ impl MemdServer {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
 
-        let entries =
-            engine_api::list_entries(&conn, request.volume_id).map_err(|e| e.to_string())?;
+        let entries = engine_api::list_entries(&conn, request.volume_id, &request.tags)
+            .map_err(|e| e.to_string())?;
 
         Ok(Json(EntryListResponse {
             entries: entries.iter().map(EntryResponse::from).collect(),
@@ -112,7 +117,7 @@ impl MemdServer {
         let conn = self.conn.lock().unwrap();
         let request = params.0;
 
-        let entries = engine_api::search(&conn, request.volume_id, request.query)
+        let entries = engine_api::search(&conn, request.volume_id, request.query, &request.tags)
             .map_err(|e| e.to_string())?;
 
         Ok(Json(EntryListResponse {
@@ -189,6 +194,24 @@ impl MemdServer {
         let request = params.0;
 
         let entry = engine_api::update_entry(&conn, request.entry_id, request.content)
+            .map_err(|e| e.to_string())?;
+
+        Ok(Json(EntryResponse::from(&entry)))
+    }
+
+    /// Replace the tags of a memory entry
+    #[tool(
+        name = "tag_memory",
+        description = "Replace all tags on a memory entry, keeping its content. Use tags to group related memories (for example by topic or project area) so they can be filtered in list_memory and search_memory. Pass an empty list to remove all tags."
+    )]
+    pub async fn tag_memory(
+        &self,
+        params: Parameters<TagMemoryRequest>,
+    ) -> Result<Json<EntryResponse>, String> {
+        let conn = self.conn.lock().unwrap();
+        let request = params.0;
+
+        let entry = engine_api::tag_entry(&conn, request.entry_id, request.tags)
             .map_err(|e| e.to_string())?;
 
         Ok(Json(EntryResponse::from(&entry)))
@@ -327,6 +350,7 @@ impl From<&Entry> for EntryResponse {
             id: e.id(),
             volume_id: e.volume_id(),
             content: e.content().to_string(),
+            tags: e.tags().to_vec(),
             created_at: e.created_at().to_rfc3339(),
             updated_at: e.updated_at().to_rfc3339(),
             source: e.source(),
@@ -342,6 +366,7 @@ impl From<&Event> for EventResponse {
             event_type: ev.event_type(),
             entry_id: ev.entry_id(),
             content: ev.content().map(str::to_string),
+            tags: ev.tags().to_vec(),
             source: ev.source(),
             created_at: ev.created_at().to_rfc3339(),
         }
@@ -391,6 +416,9 @@ pub struct ListMemoryRequest {
         description = "Numeric ID of the memory volume to inspect. Use list_volumes first if the ID is unknown."
     )]
     pub volume_id: i64,
+    #[serde(default)]
+    #[schemars(description = "Optional. Only return entries that have all of these tags.")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -407,6 +435,11 @@ pub struct RememberRequest {
         description = "Who produced the memory: user, agent, or tool. Use the source that best reflects origin."
     )]
     pub source: EntrySource,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional short labels for grouping and filtering, such as a topic or project area. Lowercase, no spaces or commas."
+    )]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -414,6 +447,7 @@ pub struct EntryResponse {
     pub id: i64,
     pub volume_id: i64,
     pub content: String,
+    pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
     pub source: EntrySource,
@@ -429,6 +463,9 @@ pub struct SearchMemoryRequest {
         description = "Keywords to search for. Entries matching any keyword (or a word starting with it) are returned, best matches first. Prefer specific names, decisions, or constraints."
     )]
     pub query: String,
+    #[serde(default)]
+    #[schemars(description = "Optional. Only return entries that have all of these tags.")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -496,6 +533,18 @@ pub struct UpdateMemoryRequest {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TagMemoryRequest {
+    #[schemars(
+        description = "Numeric ID of the memory entry to tag. Use list_memory or search_memory to find it."
+    )]
+    pub entry_id: i64,
+    #[schemars(
+        description = "The complete new list of tags. Lowercase, no spaces or commas. An empty list removes all tags."
+    )]
+    pub tags: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ForgetRequest {
     #[schemars(
         description = "Numeric ID of the memory entry to remove. Use list_memory or search_memory to find it."
@@ -539,6 +588,8 @@ pub struct EventResponse {
     pub entry_id: i64,
     /// New content for put, update and restore events.
     pub content: Option<String>,
+    /// The entry's full tag list after put, update and restore events.
+    pub tags: Vec<String>,
     pub source: Option<EntrySource>,
     pub created_at: String,
 }

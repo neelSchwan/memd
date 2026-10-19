@@ -12,6 +12,7 @@ pub enum DomainError {
     MissingEventContent,
     UnknownEventType(String),
     UnknownEntrySource(String),
+    InvalidTag(String),
 }
 
 impl fmt::Display for DomainError {
@@ -26,6 +27,10 @@ impl fmt::Display for DomainError {
             }
             DomainError::UnknownEventType(s) => write!(f, "unknown event type '{s}'"),
             DomainError::UnknownEntrySource(s) => write!(f, "unknown entry source '{s}'"),
+            DomainError::InvalidTag(tag) => write!(
+                f,
+                "invalid tag '{tag}': tags must be non-empty and contain no spaces or commas"
+            ),
         }
     }
 }
@@ -66,6 +71,25 @@ impl std::str::FromStr for EntrySource {
             _ => Err(DomainError::UnknownEntrySource(s.to_string())),
         }
     }
+}
+
+/// Cleans up a list of tags: trims and lowercases each one, then sorts and removes duplicates,
+/// so the same set of tags is always stored the same way.
+pub fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, DomainError> {
+    let mut normalized = tags
+        .into_iter()
+        .map(|tag| {
+            let tag = tag.trim().to_lowercase();
+            if tag.is_empty() || tag.contains(',') || tag.contains(char::is_whitespace) {
+                Err(DomainError::InvalidTag(tag))
+            } else {
+                Ok(tag)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
 }
 
 /// A Volume is an isolated memory namespace.
@@ -119,6 +143,7 @@ pub struct Entry {
     id: EntryId,
     volume_id: VolumeId,
     content: String,
+    tags: Vec<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     source: EntrySource,
@@ -129,6 +154,7 @@ impl Entry {
         id: EntryId,
         volume_id: VolumeId,
         content: String,
+        tags: Vec<String>,
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
         source: EntrySource,
@@ -140,6 +166,7 @@ impl Entry {
             id,
             volume_id,
             content,
+            tags: normalize_tags(tags)?,
             created_at,
             updated_at,
             source,
@@ -156,6 +183,16 @@ impl Entry {
 
     pub fn content(&self) -> &str {
         &self.content
+    }
+
+    /// Normalized tags, sorted alphabetically.
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    /// True when the entry carries every one of the given (normalized) tags.
+    pub fn has_tags(&self, tags: &[String]) -> bool {
+        tags.iter().all(|tag| self.tags.contains(tag))
     }
 
     pub fn created_at(&self) -> DateTime<Utc> {
@@ -178,7 +215,7 @@ impl Entry {
 pub enum EventType {
     /// A new entry was created.
     PutEntry,
-    /// An existing entry's content was replaced.
+    /// An existing entry's content or tags were replaced.
     UpdateEntry,
     /// An entry was removed from the live state (history is kept).
     DeleteEntry,
@@ -196,7 +233,7 @@ impl EventType {
         }
     }
 
-    /// Whether events of this type must carry the entry's new content.
+    /// Whether events of this type must carry the entry's new content and tags.
     pub fn carries_content(&self) -> bool {
         !matches!(self, EventType::DeleteEntry)
     }
@@ -223,17 +260,21 @@ pub struct Event {
     event_type: EventType,
     entry_id: EntryId,
     content: Option<String>,
+    tags: Vec<String>,
     source: Option<EntrySource>,
     created_at: DateTime<Utc>,
 }
 
 impl Event {
+    // One argument per column of the events table; a wrapper struct would only add ceremony.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         seq: SeqNumber,
         volume_id: VolumeId,
         event_type: EventType,
         entry_id: EntryId,
         content: Option<String>,
+        tags: Vec<String>,
         source: Option<EntrySource>,
         created_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
@@ -256,6 +297,7 @@ impl Event {
             event_type,
             entry_id,
             content,
+            tags: normalize_tags(tags)?,
             source,
             created_at,
         })
@@ -279,6 +321,10 @@ impl Event {
 
     pub fn content(&self) -> Option<&str> {
         self.content.as_deref()
+    }
+
+    pub fn tags(&self) -> &[String] {
+        &self.tags
     }
 
     pub fn source(&self) -> Option<EntrySource> {
@@ -347,7 +393,7 @@ impl Snapshot {
     }
 }
 
-/// An entry whose content differs between two points in a volume's history.
+/// An entry whose content or tags differ between two points in a volume's history.
 #[derive(Debug, Clone)]
 pub struct EntryModification {
     pub before: Entry,

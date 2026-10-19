@@ -17,14 +17,28 @@ fn contents(entries: &[core_types::Entry]) -> Vec<&str> {
 fn add_update_delete_are_logged_and_projected() {
     let conn = db();
     let vol = create_volume(&conn, "work".into()).unwrap();
-    let a = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::Agent).unwrap();
-    let b = add_entry(&conn, vol.id(), "likes tabs".into(), EntrySource::User).unwrap();
+    let a = add_entry(
+        &conn,
+        vol.id(),
+        "uses sqlite".into(),
+        EntrySource::Agent,
+        vec![],
+    )
+    .unwrap();
+    let b = add_entry(
+        &conn,
+        vol.id(),
+        "likes tabs".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
 
     update_entry(&conn, a.id(), "uses postgres".into()).unwrap();
     delete_entry(&conn, b.id()).unwrap();
 
     assert_eq!(
-        contents(&list_entries(&conn, vol.id()).unwrap()),
+        contents(&list_entries(&conn, vol.id(), &[]).unwrap()),
         ["uses postgres"]
     );
     assert!(matches!(
@@ -56,7 +70,7 @@ fn add_update_delete_are_logged_and_projected() {
 fn identical_update_records_nothing() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let e = add_entry(&conn, vol.id(), "same".into(), EntrySource::User).unwrap();
+    let e = add_entry(&conn, vol.id(), "same".into(), EntrySource::User, vec![]).unwrap();
     update_entry(&conn, e.id(), "same".into()).unwrap();
     assert_eq!(list_events(&conn, vol.id()).unwrap().len(), 1);
 }
@@ -65,7 +79,7 @@ fn identical_update_records_nothing() {
 fn mutating_deleted_or_missing_entries_fails() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let e = add_entry(&conn, vol.id(), "x".into(), EntrySource::User).unwrap();
+    let e = add_entry(&conn, vol.id(), "x".into(), EntrySource::User, vec![]).unwrap();
     delete_entry(&conn, e.id()).unwrap();
 
     assert!(matches!(
@@ -81,7 +95,7 @@ fn mutating_deleted_or_missing_entries_fails() {
         Err(EngineError::EntryNotFound(999))
     ));
     assert!(matches!(
-        add_entry(&conn, 999, "x".into(), EntrySource::User),
+        add_entry(&conn, 999, "x".into(), EntrySource::User, vec![]),
         Err(EngineError::VolumeNotFound(999))
     ));
     assert!(matches!(
@@ -99,6 +113,7 @@ fn search_matches_words_and_ranks_best_first() {
         vol.id(),
         "Use Postgres in production".into(),
         EntrySource::User,
+        vec![],
     )
     .unwrap();
     add_entry(
@@ -106,6 +121,7 @@ fn search_matches_words_and_ranks_best_first() {
         vol.id(),
         "Postgres pool size is 20; postgres runs on port 5432".into(),
         EntrySource::User,
+        vec![],
     )
     .unwrap();
     let auth = add_entry(
@@ -113,28 +129,33 @@ fn search_matches_words_and_ranks_best_first() {
         vol.id(),
         "Authentication bug is in middleware.rs".into(),
         EntrySource::User,
+        vec![],
     )
     .unwrap();
 
     // Case-insensitive, and the entry that mentions the word most ranks first.
-    let found = search(&conn, vol.id(), "POSTGRES".into()).unwrap();
+    let found = search(&conn, vol.id(), "POSTGRES".into(), &[]).unwrap();
     assert_eq!(found.len(), 2);
     assert!(found[0].content().starts_with("Postgres pool"));
 
     // Words match by prefix, in any order.
     assert_eq!(
-        contents(&search(&conn, vol.id(), "middleware auth".into()).unwrap()),
+        contents(&search(&conn, vol.id(), "middleware auth".into(), &[]).unwrap()),
         [auth.content()]
     );
 
     // FTS5 syntax in the query is treated as plain text, not as operators.
     assert_eq!(
-        search(&conn, vol.id(), "auth* AND \"NEAR(".into())
+        search(&conn, vol.id(), "auth* AND \"NEAR(".into(), &[])
             .unwrap()
             .len(),
         1
     );
-    assert!(search(&conn, vol.id(), "%%".into()).unwrap().is_empty());
+    assert!(
+        search(&conn, vol.id(), "%%".into(), &[])
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -142,24 +163,44 @@ fn search_follows_updates_deletes_and_volumes() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
     let other = create_volume(&conn, "other".into()).unwrap();
-    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "uses sqlite".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
     add_entry(
         &conn,
         other.id(),
         "uses sqlite too".into(),
         EntrySource::User,
+        vec![],
     )
     .unwrap();
 
-    assert_eq!(search(&conn, vol.id(), "sqlite".into()).unwrap().len(), 1);
+    assert_eq!(
+        search(&conn, vol.id(), "sqlite".into(), &[]).unwrap().len(),
+        1
+    );
 
     update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
-    assert!(search(&conn, vol.id(), "sqlite".into()).unwrap().is_empty());
-    assert_eq!(search(&conn, vol.id(), "postgres".into()).unwrap().len(), 1);
+    assert!(
+        search(&conn, vol.id(), "sqlite".into(), &[])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        search(&conn, vol.id(), "postgres".into(), &[])
+            .unwrap()
+            .len(),
+        1
+    );
 
     delete_entry(&conn, entry.id()).unwrap();
     assert!(
-        search(&conn, vol.id(), "postgres".into())
+        search(&conn, vol.id(), "postgres".into(), &[])
             .unwrap()
             .is_empty()
     );
@@ -169,23 +210,178 @@ fn search_follows_updates_deletes_and_volumes() {
 fn search_follows_clones_and_rollbacks() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "uses sqlite".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
     let snap = snapshot(&conn, vol.id(), "s".into()).unwrap();
 
     let branch = clone_volume(&conn, snap.id(), None).unwrap();
     assert_eq!(
-        search(&conn, branch.id(), "sqlite".into()).unwrap().len(),
+        search(&conn, branch.id(), "sqlite".into(), &[])
+            .unwrap()
+            .len(),
         1
     );
 
     update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
     rollback_to_snapshot(&conn, snap.id()).unwrap();
-    assert_eq!(search(&conn, vol.id(), "sqlite".into()).unwrap().len(), 1);
+    assert_eq!(
+        search(&conn, vol.id(), "sqlite".into(), &[]).unwrap().len(),
+        1
+    );
     assert!(
-        search(&conn, vol.id(), "postgres".into())
+        search(&conn, vol.id(), "postgres".into(), &[])
             .unwrap()
             .is_empty()
     );
+}
+
+fn tags(list: &[&str]) -> Vec<String> {
+    list.iter().map(|tag| tag.to_string()).collect()
+}
+
+#[test]
+fn tags_are_normalized_and_validated() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "x".into(),
+        EntrySource::User,
+        tags(&[" DB ", "auth", "db"]),
+    )
+    .unwrap();
+    assert_eq!(entry.tags(), ["auth", "db"]);
+    assert_eq!(get_entry(&conn, entry.id()).unwrap().tags(), ["auth", "db"]);
+
+    for bad in ["", "two words", "a,b"] {
+        assert!(matches!(
+            add_entry(&conn, vol.id(), "x".into(), EntrySource::User, tags(&[bad])),
+            Err(EngineError::Domain(core_types::DomainError::InvalidTag(_)))
+        ));
+    }
+}
+
+#[test]
+fn list_and_search_filter_by_all_tags() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    add_entry(
+        &conn,
+        vol.id(),
+        "postgres in prod".into(),
+        EntrySource::User,
+        tags(&["db", "prod"]),
+    )
+    .unwrap();
+    add_entry(
+        &conn,
+        vol.id(),
+        "sqlite in tests".into(),
+        EntrySource::User,
+        tags(&["db"]),
+    )
+    .unwrap();
+    add_entry(
+        &conn,
+        vol.id(),
+        "deploy on fridays".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
+
+    assert_eq!(list_entries(&conn, vol.id(), &[]).unwrap().len(), 3);
+    assert_eq!(
+        list_entries(&conn, vol.id(), &tags(&["DB"])).unwrap().len(),
+        2
+    );
+    assert_eq!(
+        contents(&list_entries(&conn, vol.id(), &tags(&["db", "prod"])).unwrap()),
+        ["postgres in prod"]
+    );
+    assert_eq!(
+        contents(&search(&conn, vol.id(), "in".into(), &tags(&["prod"])).unwrap()),
+        ["postgres in prod"]
+    );
+}
+
+#[test]
+fn tag_entry_is_versioned_like_content() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "uses sqlite".into(),
+        EntrySource::User,
+        tags(&["db"]),
+    )
+    .unwrap();
+    let before = snapshot(&conn, vol.id(), "before".into()).unwrap();
+
+    let tagged = tag_entry(&conn, entry.id(), tags(&["db", "decision"])).unwrap();
+    assert_eq!(tagged.content(), "uses sqlite");
+    assert_eq!(tagged.tags(), ["db", "decision"]);
+
+    // Updating content keeps tags; setting the same tags again records nothing.
+    update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
+    tag_entry(&conn, entry.id(), tags(&["decision", "db"])).unwrap();
+    let history = entry_history(&conn, vol.id(), entry.id()).unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[2].tags(), ["db", "decision"]);
+
+    let diff = diff_snapshots(&conn, before.id(), None).unwrap();
+    assert_eq!(diff.modified.len(), 1);
+    assert_eq!(diff.modified[0].before.tags(), ["db"]);
+
+    let branch = clone_volume(
+        &conn,
+        snapshot(&conn, vol.id(), "now".into()).unwrap().id(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        list_entries(&conn, branch.id(), &[]).unwrap()[0].tags(),
+        ["db", "decision"]
+    );
+
+    rollback_to_snapshot(&conn, before.id()).unwrap();
+    let restored = get_entry(&conn, entry.id()).unwrap();
+    assert_eq!(
+        (restored.content(), restored.tags()),
+        ("uses sqlite", &tags(&["db"])[..])
+    );
+
+    tag_entry(&conn, entry.id(), vec![]).unwrap();
+    assert!(get_entry(&conn, entry.id()).unwrap().tags().is_empty());
+}
+
+#[test]
+fn rebuild_projection_repairs_tags() {
+    let conn = db();
+    let vol = create_volume(&conn, "v".into()).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "x".into(),
+        EntrySource::User,
+        tags(&["keep"]),
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE entries SET tags = 'tampered' WHERE id = ?1",
+        [entry.id()],
+    )
+    .unwrap();
+    assert_eq!(rebuild_projection(&conn, vol.id()).unwrap(), 1);
+    assert_eq!(get_entry(&conn, entry.id()).unwrap().tags(), ["keep"]);
 }
 
 #[test]
@@ -202,7 +398,7 @@ fn snapshot_of_empty_volume_is_valid() {
 fn state_at_replays_history() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let e = add_entry(&conn, vol.id(), "v1".into(), EntrySource::User).unwrap();
+    let e = add_entry(&conn, vol.id(), "v1".into(), EntrySource::User, vec![]).unwrap();
     update_entry(&conn, e.id(), "v2".into()).unwrap();
     delete_entry(&conn, e.id()).unwrap();
 
@@ -216,14 +412,14 @@ fn state_at_replays_history() {
 fn diff_reports_added_removed_modified() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let keep = add_entry(&conn, vol.id(), "keep".into(), EntrySource::User).unwrap();
-    let change = add_entry(&conn, vol.id(), "old".into(), EntrySource::User).unwrap();
-    let drop = add_entry(&conn, vol.id(), "drop".into(), EntrySource::User).unwrap();
+    let keep = add_entry(&conn, vol.id(), "keep".into(), EntrySource::User, vec![]).unwrap();
+    let change = add_entry(&conn, vol.id(), "old".into(), EntrySource::User, vec![]).unwrap();
+    let drop = add_entry(&conn, vol.id(), "drop".into(), EntrySource::User, vec![]).unwrap();
     let s1 = snapshot(&conn, vol.id(), "s1".into()).unwrap();
 
     update_entry(&conn, change.id(), "new".into()).unwrap();
     delete_entry(&conn, drop.id()).unwrap();
-    add_entry(&conn, vol.id(), "added".into(), EntrySource::User).unwrap();
+    add_entry(&conn, vol.id(), "added".into(), EntrySource::User, vec![]).unwrap();
     let s2 = snapshot(&conn, vol.id(), "s2".into()).unwrap();
 
     let d = diff_snapshots(&conn, s1.id(), Some(s2.id())).unwrap();
@@ -249,13 +445,13 @@ fn diff_reports_added_removed_modified() {
 fn rollback_restores_state_without_rewriting_history() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let a = add_entry(&conn, vol.id(), "a1".into(), EntrySource::User).unwrap();
-    let b = add_entry(&conn, vol.id(), "b".into(), EntrySource::User).unwrap();
+    let a = add_entry(&conn, vol.id(), "a1".into(), EntrySource::User, vec![]).unwrap();
+    let b = add_entry(&conn, vol.id(), "b".into(), EntrySource::User, vec![]).unwrap();
     let before = snapshot(&conn, vol.id(), "before".into()).unwrap();
 
     update_entry(&conn, a.id(), "a2".into()).unwrap();
     delete_entry(&conn, b.id()).unwrap();
-    add_entry(&conn, vol.id(), "c".into(), EntrySource::User).unwrap();
+    add_entry(&conn, vol.id(), "c".into(), EntrySource::User, vec![]).unwrap();
     let after = snapshot(&conn, vol.id(), "after".into()).unwrap();
 
     let report = rollback_to_snapshot(&conn, before.id()).unwrap();
@@ -263,7 +459,7 @@ fn rollback_restores_state_without_rewriting_history() {
     assert_eq!(report.events_appended, 3); // update a, restore b, delete c
     assert_eq!(report.to_seq, 8);
     assert_eq!(
-        contents(&list_entries(&conn, vol.id()).unwrap()),
+        contents(&list_entries(&conn, vol.id(), &[]).unwrap()),
         ["a1", "b"]
     );
     assert!(diff_snapshots(&conn, before.id(), None).unwrap().is_empty());
@@ -272,7 +468,7 @@ fn rollback_restores_state_without_rewriting_history() {
     assert_eq!(list_events(&conn, vol.id()).unwrap().len(), 8);
     rollback_to_snapshot(&conn, after.id()).unwrap();
     assert_eq!(
-        contents(&list_entries(&conn, vol.id()).unwrap()),
+        contents(&list_entries(&conn, vol.id(), &[]).unwrap()),
         ["a2", "c"]
     );
 
@@ -288,27 +484,34 @@ fn rollback_to_empty_snapshot_clears_volume() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
     let empty = snapshot(&conn, vol.id(), "empty".into()).unwrap();
-    add_entry(&conn, vol.id(), "x".into(), EntrySource::User).unwrap();
+    add_entry(&conn, vol.id(), "x".into(), EntrySource::User, vec![]).unwrap();
     rollback_to_snapshot(&conn, empty.id()).unwrap();
-    assert!(list_entries(&conn, vol.id()).unwrap().is_empty());
+    assert!(list_entries(&conn, vol.id(), &[]).unwrap().is_empty());
 }
 
 #[test]
 fn clone_copies_history_and_diverges_independently() {
     let conn = db();
     let vol = create_volume(&conn, "plan".into()).unwrap();
-    let a = add_entry(&conn, vol.id(), "a1".into(), EntrySource::Agent).unwrap();
-    let b = add_entry(&conn, vol.id(), "b".into(), EntrySource::User).unwrap();
+    let a = add_entry(&conn, vol.id(), "a1".into(), EntrySource::Agent, vec![]).unwrap();
+    let b = add_entry(&conn, vol.id(), "b".into(), EntrySource::User, vec![]).unwrap();
     update_entry(&conn, a.id(), "a2".into()).unwrap();
     delete_entry(&conn, b.id()).unwrap();
     let snap = snapshot(&conn, vol.id(), "s".into()).unwrap();
-    add_entry(&conn, vol.id(), "after snapshot".into(), EntrySource::User).unwrap();
+    add_entry(
+        &conn,
+        vol.id(),
+        "after snapshot".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
 
     let branch = clone_volume(&conn, snap.id(), None).unwrap();
     assert_eq!(branch.name(), "plan_clone");
     assert_eq!(branch.parent_snapshot_id(), Some(snap.id()));
 
-    let entries = list_entries(&conn, branch.id()).unwrap();
+    let entries = list_entries(&conn, branch.id(), &[]).unwrap();
     assert_eq!(contents(&entries), ["a2"]);
     assert_eq!(entries[0].source(), EntrySource::Agent);
     assert_ne!(entries[0].id(), a.id());
@@ -317,7 +520,7 @@ fn clone_copies_history_and_diverges_independently() {
     // Changes on the branch leave the source alone and vice versa.
     update_entry(&conn, entries[0].id(), "branch only".into()).unwrap();
     assert_eq!(
-        contents(&list_entries(&conn, vol.id()).unwrap()),
+        contents(&list_entries(&conn, vol.id(), &[]).unwrap()),
         ["a2", "after snapshot"]
     );
 
@@ -348,8 +551,8 @@ fn failed_clone_leaves_no_partial_volume() {
 fn rebuild_projection_repairs_tampered_entries() {
     let conn = db();
     let vol = create_volume(&conn, "v".into()).unwrap();
-    let a = add_entry(&conn, vol.id(), "truth".into(), EntrySource::User).unwrap();
-    let b = add_entry(&conn, vol.id(), "gone".into(), EntrySource::User).unwrap();
+    let a = add_entry(&conn, vol.id(), "truth".into(), EntrySource::User, vec![]).unwrap();
+    let b = add_entry(&conn, vol.id(), "gone".into(), EntrySource::User, vec![]).unwrap();
     delete_entry(&conn, b.id()).unwrap();
 
     conn.execute(
@@ -361,7 +564,10 @@ fn rebuild_projection_repairs_tampered_entries() {
         .unwrap();
 
     assert_eq!(rebuild_projection(&conn, vol.id()).unwrap(), 2);
-    assert_eq!(contents(&list_entries(&conn, vol.id()).unwrap()), ["truth"]);
+    assert_eq!(
+        contents(&list_entries(&conn, vol.id(), &[]).unwrap()),
+        ["truth"]
+    );
     assert_eq!(rebuild_projection(&conn, vol.id()).unwrap(), 0);
 }
 
@@ -401,7 +607,7 @@ fn migrates_v0_database() {
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
 
-    let entries = list_entries(&conn, 1).unwrap();
+    let entries = list_entries(&conn, 1, &[]).unwrap();
     assert_eq!(contents(&entries), ["old fact"]);
     assert_eq!(entries[0].updated_at(), entries[0].created_at());
     assert_eq!(
@@ -411,10 +617,13 @@ fn migrates_v0_database() {
     assert_eq!(rebuild_projection(&conn, 1).unwrap(), 0);
 
     // New features work on migrated data.
-    assert_eq!(search(&conn, 1, "fact".into()).unwrap().len(), 1);
+    assert_eq!(search(&conn, 1, "fact".into(), &[]).unwrap().len(), 1);
     update_entry(&conn, 1, "new fact".into()).unwrap();
     rollback_to_snapshot(&conn, 1).unwrap();
-    assert_eq!(contents(&list_entries(&conn, 1).unwrap()), ["old fact"]);
+    assert_eq!(
+        contents(&list_entries(&conn, 1, &[]).unwrap()),
+        ["old fact"]
+    );
 }
 
 #[test]
@@ -451,6 +660,7 @@ fn concurrent_writers_on_one_file_all_succeed() {
                         volume_id,
                         format!("{writer}-{i}"),
                         EntrySource::Agent,
+                        vec![],
                     )
                     .unwrap();
                 }
@@ -471,19 +681,29 @@ fn concurrent_writers_on_one_file_all_succeed() {
     remove_database_files(&path);
 }
 
-/// Path of a fresh v1 database file (the schema before the full-text index) holding one volume
-/// whose only entry was updated from "uses sqlite" to "uses postgres".
+/// Path of a v1 database file (before the full-text index and tags) holding one volume whose
+/// only entry was updated from "uses sqlite" to "uses postgres". Built by creating a current
+/// database and undoing every later migration.
 fn v1_database_file(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("memd-{name}-{}.db", std::process::id()));
     remove_database_files(&path);
     let conn = open_db(&path).unwrap();
     let vol = create_volume(&conn, "legacy".into()).unwrap();
-    let entry = add_entry(&conn, vol.id(), "uses sqlite".into(), EntrySource::User).unwrap();
+    let entry = add_entry(
+        &conn,
+        vol.id(),
+        "uses sqlite".into(),
+        EntrySource::User,
+        vec![],
+    )
+    .unwrap();
     update_entry(&conn, entry.id(), "uses postgres".into()).unwrap();
     conn.execute_batch(
         "DROP TRIGGER entries_fts_insert;
          DROP TRIGGER entries_fts_update;
          DROP TABLE entries_fts;
+         ALTER TABLE entries DROP COLUMN tags;
+         ALTER TABLE events DROP COLUMN tags;
          PRAGMA user_version = 1;",
     )
     .unwrap();
@@ -502,10 +722,12 @@ fn migrates_v1_database_and_indexes_current_content() {
     let conn = open_db(&path).unwrap();
 
     assert_eq!(
-        contents(&search(&conn, 1, "postgres".into()).unwrap()),
+        contents(&search(&conn, 1, "postgres".into(), &[]).unwrap()),
         ["uses postgres"]
     );
-    assert!(search(&conn, 1, "sqlite".into()).unwrap().is_empty());
+    assert!(search(&conn, 1, "sqlite".into(), &[]).unwrap().is_empty());
+    assert!(list_entries(&conn, 1, &[]).unwrap()[0].tags().is_empty());
+    tag_entry(&conn, 1, tags(&["db"])).unwrap();
 
     drop(conn);
     remove_database_files(&path);
@@ -531,7 +753,7 @@ fn processes_starting_together_migrate_once() {
         opener.join().unwrap().unwrap();
     }
     assert_eq!(
-        search(&open_db(&path).unwrap(), 1, "postgres".into())
+        search(&open_db(&path).unwrap(), 1, "postgres".into(), &[])
             .unwrap()
             .len(),
         1

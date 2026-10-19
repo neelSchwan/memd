@@ -3,7 +3,7 @@ use core_types::{Entry, EntrySource, Event, MemoryDiff};
 use engine_api::{
     add_entry, clone_volume, create_volume, delete_entry, diff_snapshots, entries_at_snapshot,
     entry_history, list_entries, list_events, list_snapshots, list_volumes, open_db,
-    rebuild_projection, rollback_to_snapshot, search, snapshot, update_entry,
+    rebuild_projection, rollback_to_snapshot, search, snapshot, tag_entry, update_entry,
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,19 +71,36 @@ enum EntryCommands {
         content: String,
         #[arg(long, default_value = "user")]
         source: EntrySource,
+        /// Tag the entry (repeat for several tags)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
 
     /// Replace the content of an entry
     Update { entry_id: i64, content: String },
 
+    /// Replace all tags of an entry (no tags removes them all)
+    Tag { entry_id: i64, tags: Vec<String> },
+
     /// Delete an entry (it stays in history)
     Delete { entry_id: i64 },
 
     /// List all entries in a volume
-    List { volume_id: i64 },
+    List {
+        volume_id: i64,
+        /// Only entries with this tag (repeat to require several)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
 
     /// Search entries in a volume by content
-    Search { volume_id: i64, query: String },
+    Search {
+        volume_id: i64,
+        query: String,
+        /// Only entries with this tag (repeat to require several)
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
 
     /// Show every change made to an entry
     History { volume_id: i64, entry_id: i64 },
@@ -112,7 +129,11 @@ enum SnapshotCommands {
 
 fn print_entries(entries: &[Entry]) {
     for e in entries {
-        println!("[{}] {}", e.id(), e.content());
+        if e.tags().is_empty() {
+            println!("[{}] {}", e.id(), e.content());
+        } else {
+            println!("[{}] {} #{}", e.id(), e.content(), e.tags().join(" #"));
+        }
     }
 }
 
@@ -177,22 +198,31 @@ fn run(cli: Cli) -> engine_api::Result<()> {
                 volume_id,
                 content,
                 source,
+                tags,
             } => {
-                let entry = add_entry(&conn, volume_id, content, source)?;
+                let entry = add_entry(&conn, volume_id, content, source, tags)?;
                 println!("Added entry (id: {})", entry.id());
             }
             EntryCommands::Update { entry_id, content } => {
                 let entry = update_entry(&conn, entry_id, content)?;
                 println!("Updated entry (id: {})", entry.id());
             }
+            EntryCommands::Tag { entry_id, tags } => {
+                let entry = tag_entry(&conn, entry_id, tags)?;
+                println!("Tagged entry (id: {})", entry.id());
+            }
             EntryCommands::Delete { entry_id } => {
                 let entry = delete_entry(&conn, entry_id)?;
                 println!("Deleted entry (id: {})", entry.id());
             }
-            EntryCommands::List { volume_id } => print_entries(&list_entries(&conn, volume_id)?),
-            EntryCommands::Search { volume_id, query } => {
-                print_entries(&search(&conn, volume_id, query)?)
+            EntryCommands::List { volume_id, tags } => {
+                print_entries(&list_entries(&conn, volume_id, &tags)?)
             }
+            EntryCommands::Search {
+                volume_id,
+                query,
+                tags,
+            } => print_entries(&search(&conn, volume_id, query, &tags)?),
             EntryCommands::History {
                 volume_id,
                 entry_id,

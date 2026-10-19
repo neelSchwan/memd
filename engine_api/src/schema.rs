@@ -3,7 +3,7 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use crate::error::{EngineError, Result};
 
 /// Bump this and add a step to `migrate` whenever the schema changes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = "
     CREATE TABLE volumes (
@@ -95,6 +95,12 @@ const MIGRATE_V1_TO_V2: &str = "
     END;
 ";
 
+/// Entry tags. Put, update and restore events carry the entry's full tag list, like its content.
+const MIGRATE_V2_TO_V3: &str = "
+    ALTER TABLE entries ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+    ALTER TABLE events ADD COLUMN tags TEXT NOT NULL DEFAULT '';
+";
+
 fn table_exists(tx: &Transaction, name: &str) -> Result<bool> {
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -132,6 +138,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
     if version < 2 {
         tx.execute_batch(MIGRATE_V1_TO_V2)?;
+    }
+    if version < 3 {
+        tx.execute_batch(MIGRATE_V2_TO_V3)?;
     }
 
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
