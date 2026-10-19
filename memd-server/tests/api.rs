@@ -391,3 +391,20 @@ fn patch_changes_content_and_tags_together_or_not_at_all() {
         "old"
     );
 }
+
+#[test]
+fn serves_the_web_ui_at_the_root() {
+    let response = handle(
+        &db(),
+        &Request {
+            method: "GET",
+            url: "/",
+            host: Some("localhost:7878"),
+            content_type: None,
+            body: "",
+        },
+    );
+    assert_eq!(response.status, 200);
+    assert!(response.content_type.starts_with("text/html"));
+    assert!(response.body.contains("<title>memd</title>"));
+}

@@ -32,6 +32,8 @@
 //! in the user's browser from using it: requests must name a local `Host` (which defeats DNS
 //! rebinding), and requests that change anything must be sent as `application/json`, which a
 //! page on another origin can't do without a CORS preflight that this server never answers.
+//!
+//! `GET /` serves the web UI, a single static page (`ui/index.html`) that uses these routes.
 
 use core_types::EntrySource;
 use engine_api::{Connection, EngineError};
@@ -115,6 +117,9 @@ fn is_local_host(host: &str) -> bool {
     matches!(name, "localhost" | "127.0.0.1" | "[::1]")
 }
 
+/// The web UI, compiled into the binary so the server is a single file.
+const UI: &str = include_str!("../ui/index.html");
+
 /// Handles one request.
 pub fn handle(conn: &Connection, request: &Request) -> Response {
     if !request.host.is_some_and(is_local_host) {
@@ -122,6 +127,13 @@ pub fn handle(conn: &Connection, request: &Request) -> Response {
             403,
             "memd-server only accepts requests to localhost".to_string(),
         );
+    }
+    if request.method == "GET" && (request.url == "/" || request.url.starts_with("/?")) {
+        return Response {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: UI.to_string(),
+        };
     }
     let is_json = request
         .content_type

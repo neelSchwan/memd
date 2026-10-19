@@ -111,6 +111,14 @@ every request except GET; browsers can't send that cross-site without a prefligh
 never answers preflights. Bodies are capped at 1 MiB. One local process that sends a body slowly
 can still hold up the single request loop; that is accepted for a local tool.
 
+**The web UI is one static file served by `memd-server`.** `memd-server/ui/index.html` is plain
+HTML, CSS and JavaScript with no framework, build step or CDN, embedded with `include_str!`. It
+only calls the JSON API, so it adds no logic of its own. All user content is rendered with
+`textContent`, never `innerHTML`, so stored memories can't inject markup. The roadmap originally
+named a separate `memd-ui` crate; serving it from the API server was simpler and needs no CORS.
+It was checked end to end in headless Chromium with Playwright: create, tag, search, snapshot,
+branch, merge preview, merge, history, error display and an HTML-injection attempt.
+
 **Update events don't record a source.** The entry keeps the source of whoever created it. If
 per-change attribution becomes important, add it to `update_entry` events.
 
@@ -181,3 +189,8 @@ printf '%s\n' \
   404/409/400/500, plus the local-only `Host` and JSON content-type checks. Configured with
   `MEMD_DB` and `MEMD_ADDR`. `edit_entry` changes content and tags in one event, for PATCH. New dependencies: `tiny_http`, and
   `serde_json` (already in the tree through `rmcp`).
+
+### 2026-10-19: Web UI
+
+- `GET /` on `memd-server` serves `memd-server/ui/index.html`, covering entries, history,
+  snapshots, and compare and merge.

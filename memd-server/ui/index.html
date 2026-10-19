@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memd</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e2e2dc;
+    --accent: #2f6fdf; --danger: #c43d3d; --added: #e5f4e8; --removed: #fbe7e7; --changed: #fdf3dc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --text: #ecece8; --muted: #9a9a93; --line: #34342f;
+      --accent: #6c9cf0; --danger: #e06c6c; --added: #1f3324; --removed: #3a2222; --changed: #3a3220;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--line); font-weight: 600; }
+  main { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 49px); }
+  aside { border-right: 1px solid var(--line); padding: 16px; }
+  section { padding: 16px 24px; max-width: 900px; }
+  h2 { margin: 0 0 4px; font-size: 20px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  button, input, select {
+    font: inherit; color: inherit; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px;
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  input { min-width: 0; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .grow { flex: 1; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .volume { display: block; width: 100%; text-align: left; border: none; margin: 2px 0; }
+  .volume.selected { background: var(--accent); color: #fff; }
+  .tabs { display: flex; gap: 4px; margin: 12px 0; border-bottom: 1px solid var(--line); }
+  .tabs button { border: none; border-radius: 6px 6px 0 0; background: none; }
+  .tabs button.selected { background: var(--panel); border: 1px solid var(--line); border-bottom-color: var(--panel); margin-bottom: -1px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+  .card.added { background: var(--added); } .card.removed { background: var(--removed); } .card.changed { background: var(--changed); }
+  .tag { display: inline-block; font-size: 12px; padding: 0 6px; margin-right: 4px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+  #error { display: none; margin: 8px 0; padding: 8px 12px; border-radius: 6px; background: var(--removed); }
+  @media (max-width: 700px) { main { grid-template-columns: 1fr; } aside { border-right: none; border-bottom: 1px solid var(--line); } section { padding: 16px; } }
+</style>
+</head>
+<body>
+<header>memd</header>
+<main>
+  <aside>
+    <ul id="volumes"></ul>
+    <form id="new-volume" class="row">
+      <input name="volumeName" class="grow" placeholder="New volume" required>
+      <button>Add</button>
+    </form>
+  </aside>
+  <section id="volume">
+    <p class="muted">Select or create a volume.</p>
+  </section>
+</main>
+
+<script>
+// A small client for memd-server's JSON API. All user content is rendered with textContent.
+
+let volumes = [];
+let selectedVolume = null;
+let selectedTab = "entries";
+// The entries tab's filter; cleared when another volume is selected.
+let searchQuery = "";
+let searchTags = "";
+
+async function api(method, path, body) {
+  const response = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error);
+  return data;
+}
+
+/** Builds an element: el("button", { onclick }, "Save"). Strings become text nodes. */
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children.flat().filter((child) => child != null));
+  return node;
+}
+
+function showError(error) {
+  const box = document.getElementById("error");
+  if (!box) return alert(error.message);
+  box.textContent = error.message;
+  box.style.display = "block";
+}
+
+/** Runs an action and re-renders, showing any error instead of failing silently. */
+async function act(action) {
+  try {
+    await action();
+    await render();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+function tagList(tags) {
+  return tags.map((tag) => el("span", { className: "tag" }, tag));
+}
+
+function parseTags(text) {
+  return text.split(/[\s,]+/).filter(Boolean);
+}
+
+function entryCard(entry, className = "", actions = []) {
+  return el("div", { className: `card ${className}` },
+    el("div", {}, entry.content),
+    el("div", { className: "row muted" },
+      `#${entry.id} · ${entry.source} · ${new Date(entry.updated_at).toLocaleString()}`,
+      tagList(entry.tags), ...actions));
+}
+
+/** Renders a list of added / removed / modified entries, as returned by the diff endpoints. */
+function changesView(diff) {
+  const cards = [
+    ...diff.added.map((entry) => entryCard(entry, "added")),
+    ...diff.removed.map((entry) => entryCard(entry, "removed")),
+    ...diff.modified.map((change) => el("div", { className: "card changed" },
+      el("div", { className: "muted" }, "before"), el("div", {}, change.before.content, " ", tagList(change.before.tags)),
+      el("div", { className: "muted" }, "after"), el("div", {}, change.after.content, " ", tagList(change.after.tags)))),
+  ];
+  return cards.length ? cards : [el("p", { className: "muted" }, "No differences.")];
+}
+
+async function renderVolumes() {
+  volumes = await api("GET", "/api/volumes");
+  document.getElementById("volumes").replaceChildren(...volumes.map((volume) =>
+    el("li", {}, el("button", {
+      className: `volume ${volume.id === selectedVolume?.id ? "selected" : ""}`,
+      onclick: () => {
+        selectedVolume = volume;
+        selectedTab = "entries";
+        searchQuery = searchTags = "";
+        render();
+      },
+    }, volume.name))));
+}
+
+async function entriesTab(volume) {
+  const filter = el("form", { className: "row" },
+    el("input", { name: "q", className: "grow", placeholder: "Search", value: searchQuery }),
+    el("input", { name: "tags", placeholder: "Filter by tags", value: searchTags }),
+    el("button", {}, "Filter"));
+  filter.onsubmit = (event) => {
+    event.preventDefault();
+    searchQuery = filter.q.value;
+    searchTags = filter.tags.value;
+    render();
+  };
+
+  const params = new URLSearchParams();
+  if (searchQuery) params.set("q", searchQuery);
+  parseTags(searchTags).forEach((tag) => params.append("tag", tag));
+  const path = searchQuery ? "search" : "entries";
+  const entries = await api("GET", `/api/volumes/${volume.id}/${path}?${params}`);
+
+  const add = el("form", { className: "row" },
+    el("input", { name: "content", className: "grow", placeholder: "Remember something", required: true }),
+    el("input", { name: "tags", placeholder: "Tags" }),
+    el("button", { className: "primary" }, "Add"));
+  add.onsubmit = (event) => {
+    event.preventDefault();
+    act(() => api("POST", `/api/volumes/${volume.id}/entries`,
+      { content: add.content.value, tags: parseTags(add.tags.value) }));
+  };
+
+  const cards = entries.map((entry) => entryCard(entry, "", [
+    el("button", { onclick: () => {
+      const content = prompt("Content", entry.content);
+      if (content !== null) act(() => api("PATCH", `/api/entries/${entry.id}`, { content }));
+    } }, "Edit"),
+    el("button", { onclick: () => {
+      const tags = prompt("Tags (space separated)", entry.tags.join(" "));
+      if (tags !== null) act(() => api("PATCH", `/api/entries/${entry.id}`, { tags: parseTags(tags) }));
+    } }, "Tags"),
+    el("button", { className: "danger", onclick: () => act(() => api("DELETE", `/api/entries/${entry.id}`)) }, "Forget"),
+  ]));
+  return [add, filter, ...(cards.length ? cards : [el("p", { className: "muted" }, "No entries.")])];
+}
+
+async function historyTab(volume) {
+  const events = await api("GET", `/api/volumes/${volume.id}/events`);
+  return events.reverse().map((event) => el("div", { className: "card" },
+    el("div", { className: "row muted" },
+      `#${event.seq} · ${event.event_type.replace("_", " ")} · entry ${event.entry_id} · ${new Date(event.created_at).toLocaleString()}`),
+    event.content == null ? null : el("div", {}, event.content, " ", tagList(event.tags))));
+}
+
+async function snapshotsTab(volume) {
+  const snapshots = await api("GET", `/api/volumes/${volume.id}/snapshots`);
+  const create = el("form", { className: "row" },
+    el("input", { name: "label", className: "grow", placeholder: "Snapshot label", required: true }),
+    el("button", { className: "primary" }, "Snapshot"));
+  create.onsubmit = (event) => {
+    event.preventDefault();
+    act(() => api("POST", `/api/volumes/${volume.id}/snapshots`, { label: create.label.value }));
+  };
+
+  const detail = el("div");
+  const show = async (title, load) => {
+    try {
+      detail.replaceChildren(el("h3", {}, title), ...(await load()));
+    } catch (error) {
+      showError(error);
+    }
+  };
+  const cards = snapshots.reverse().map((snapshot) => el("div", { className: "card" },
+    el("div", {}, snapshot.label),
+    el("div", { className: "row muted" },
+      `#${snapshot.id} · at event ${snapshot.event_seq_pointer} · ${new Date(snapshot.created_at).toLocaleString()}`,
+      el("button", { onclick: () => show(`Entries at "${snapshot.label}"`, async () =>
+        (await api("GET", `/api/snapshots/${snapshot.id}/entries`)).map((entry) => entryCard(entry))) }, "View"),
+      el("button", { onclick: () => show(`Changes since "${snapshot.label}"`, async () =>
+        changesView(await api("GET", `/api/snapshots/${snapshot.id}/diff`))) }, "Diff"),
+      el("button", { onclick: () => confirm(`Roll "${volume.name}" back to "${snapshot.label}"? History is kept.`) &&
+        act(() => api("POST", `/api/snapshots/${snapshot.id}/rollback`)) }, "Roll back"),
+      el("button", { onclick: () => {
+        const name = prompt("Name for the new branch (leave empty for a default)");
+        if (name !== null) act(async () => {
+          selectedVolume = await api("POST", `/api/snapshots/${snapshot.id}/branch`, { name: name || undefined });
+          selectedTab = "entries";
+        });
+      } }, "Branch"))));
+  return [create, ...cards, detail];
+}
+
+async function branchesTab(volume) {
+  const others = volumes.filter((other) => other.id !== volume.id);
+  if (!others.length) return [el("p", { className: "muted" }, "Branch from a snapshot to compare and merge volumes.")];
+
+  const picker = el("select", {}, others.map((other) => el("option", { value: other.id }, other.name)));
+  const result = el("div");
+  const merge = async (dryRun) => {
+    try {
+      const report = await api("POST", `/api/volumes/${volume.id}/merge/${picker.value}?dry_run=${dryRun}`);
+      const summary = `${dryRun ? "Events to append" : "Events appended"}: ${report.events_appended} · ` +
+        `conflicts left as they are: ${report.conflicts.length}`;
+      const conflicts = report.conflicts.map((conflict) => el("div", { className: "card changed" },
+        el("div", { className: "muted" }, "conflict: target keeps"), el("div", {}, conflict.target?.content ?? "(deleted)"),
+        el("div", { className: "muted" }, "source has"), el("div", {}, conflict.source?.content ?? "(deleted)")));
+      result.replaceChildren(el("p", {}, summary), ...changesView(report), ...conflicts);
+      if (!dryRun) await renderVolumes();
+    } catch (error) {
+      showError(error);
+    }
+  };
+  return [
+    el("div", { className: "row" }, `Compare "${volume.name}" with`, picker,
+      el("button", { onclick: async () => {
+        try {
+          result.replaceChildren(...changesView(await api("GET", `/api/volumes/${volume.id}/diff/${picker.value}`)));
+        } catch (error) {
+          showError(error);
+        }
+      } }, "Diff"),
+      el("button", { onclick: () => merge(true) }, "Preview merge into it"),
+      el("button", { className: "primary", onclick: () => merge(false) }, "Merge into it")),
+    result,
+  ];
+}
+
+const tabs = { entries: ["Entries", entriesTab], history: ["History", historyTab],
+  snapshots: ["Snapshots", snapshotsTab], branches: ["Compare & merge", branchesTab] };
+
+async function render() {
+  await renderVolumes();
+  if (!selectedVolume) return;
+  const volume = volumes.find((v) => v.id === selectedVolume.id) ?? selectedVolume;
+  const parent = volume.parent_snapshot_id ? ` · branched from snapshot #${volume.parent_snapshot_id}` : "";
+  const [, tabView] = tabs[selectedTab];
+  document.getElementById("volume").replaceChildren(
+    el("h2", {}, volume.name),
+    el("div", { className: "muted" }, `Volume #${volume.id}${parent}`),
+    el("div", { id: "error" }),
+    el("div", { className: "tabs" }, Object.entries(tabs).map(([key, [label]]) =>
+      el("button", { className: key === selectedTab ? "selected" : "", onclick: () => { selectedTab = key; render(); } }, label))),
+    ...(await tabView(volume)));
+}
+
+document.getElementById("new-volume").onsubmit = (event) => {
+  event.preventDefault();
+  const form = event.target;
+  act(async () => {
+    selectedVolume = await api("POST", "/api/volumes", { name: form.volumeName.value });
+    form.reset();
+  });
+};
+
+render().catch(showError);
+</script>
+</body>
+</html>
