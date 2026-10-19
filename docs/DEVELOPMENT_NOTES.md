@@ -12,8 +12,8 @@ finish a meaningful piece of work.
   foreign key); deletion sets `deleted = 1`.
 - Schema version is 3 (`PRAGMA user_version`). Databases from before versioning ("v0") are
   migrated automatically.
-- Tests: `engine_api/tests/engine.rs`. The MCP server has no automated tests; it was checked by
-  hand over stdio (see below).
+- Tests: `engine_api/tests/engine.rs` for the engine, and `memd-mcp/tests/mcp.rs`, which starts the
+  real `memd-mcp` binary on a temporary database and calls tools over stdio JSON-RPC.
 
 ## Design decisions
 
@@ -69,7 +69,7 @@ per-change attribution becomes important, add it to `update_entry` events.
 
 ## Manual MCP check
 
-To check the MCP server by hand, pipe JSON-RPC lines into it:
+The automated tests cover the tools. To poke at the server by hand, pipe JSON-RPC lines into it:
 
 ```bash
 printf '%s\n' \
@@ -88,7 +88,6 @@ printf '%s\n' \
 - **Cross-branch diff and merge.** Clones get new entry ids, so comparing a branch with its parent
   needs a way to track which entry a cloned entry came from (for example an `origin_entry_id`
   column set during cloning).
-- **MCP tests** that start the server in-process and call tools.
 
 ## History
 
@@ -117,3 +116,11 @@ printf '%s\n' \
 
 - Schema v3 adds `tags` to `entries` and `events`. New `tag_entry`; `add_entry`, `list_entries` and
   `search` take tags. MCP: `tag_memory`, plus `tags` on `remember`, `list_memory`, `search_memory`.
+
+### 2026-10-19: MCP tests
+
+- Added `memd-mcp/tests/mcp.rs`. It runs the compiled server binary (not an in-process server) so
+  the tests also cover the stdio transport, request parsing and how tool errors are reported.
+  Covered: the tool list, a remember/update/forget/rollback workflow, branching, tag filtering,
+  omitted optional fields and `isError` results. `serde_json` is a dev-dependency only; it was
+  already in the dependency tree through `rmcp`.
